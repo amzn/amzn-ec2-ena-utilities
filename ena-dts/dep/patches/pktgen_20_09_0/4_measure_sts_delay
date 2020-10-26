@@ -1,0 +1,170 @@
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: MIT-0
+
+diff --git a/app/lpktgenlib.c b/app/lpktgenlib.c
+index 49a82fc..9ae4484 100644
+--- a/app/lpktgenlib.c
++++ b/app/lpktgenlib.c
+@@ -2847,8 +2847,11 @@ static void
+ port_stats(lua_State *L, port_info_t *info, char *type)
+ {
+ 	eth_stats_t stats;
++	uint64_t rx_delay_sec;
+ 
+ 	pktgen_port_stats(info->pid, type, &stats);
++	rx_delay_sec =
++		(uint64_t)(info->rx_stop_tv.tv_sec - info->rx_start_tv.tv_sec);
+ 
+ 	lua_pushinteger(L, info->pid);	/* Push the table index */
+ 	lua_newtable(L);		/* Create the structure table for a packet */
+@@ -2867,6 +2870,9 @@ port_stats(lua_State *L, port_info_t *info, char *type)
+ 		setf_integer(L, "pkts_tx", stats.opackets);
+ 		setf_integer(L, "mbits_rx", iBitsTotal(stats) / Million);
+ 		setf_integer(L, "mbits_tx", oBitsTotal(stats) / Million);
++	} else {
++		setf_integer(L, "o_sts_delay_sec", info->tx_delay_sec);
++		setf_integer(L, "i_sts_delay_sec", rx_delay_sec);
+ 	}
+ 
+ 	/* Now set the table as an array with pid as the index. */
+diff --git a/app/pktgen-cmds.c b/app/pktgen-cmds.c
+index 0634cab..f77ff58 100644
+--- a/app/pktgen-cmds.c
++++ b/app/pktgen-cmds.c
+@@ -8,6 +8,7 @@
+ 
+ #include <string.h>
+ #include <sys/stat.h>
++#include <sys/time.h>
+ 
+ #include <lua_config.h>
+ 
+@@ -1511,6 +1512,9 @@ pktgen_start_transmitting(port_info_t *info)
+ 		if (rte_atomic64_read(&info->current_tx_count) == 0)
+ 			pktgen_set_port_flags(info, SEND_FOREVER);
+ 
++		gettimeofday(&info->tx_start_tv, NULL);
++		info->tx_delay_sec = 0;
++
+ 		pktgen_set_port_flags(info, SENDING_PACKETS);
+ 	}
+ }
+@@ -1531,11 +1535,19 @@ void
+ pktgen_stop_transmitting(port_info_t *info)
+ {
+ 	uint8_t q;
++	struct timeval tx_stop_tv;
++	int64_t sec_diff;
+ 
+ 	if (pktgen_tst_port_flags(info, SENDING_PACKETS)) {
++		gettimeofday(&tx_stop_tv, NULL);
+ 		pktgen_clr_port_flags(info, (SENDING_PACKETS | SEND_FOREVER));
+ 		for (q = 0; q < get_port_txcnt(pktgen.l2p, info->pid); q++)
+ 			pktgen_set_q_flags(info, q, DO_TX_FLUSH);
++
++		sec_diff = tx_stop_tv.tv_sec - info->tx_start_tv.tv_sec;
++		if (sec_diff < 0)
++			sec_diff = 0;
++		info->tx_delay_sec = (uint64_t)sec_diff;
+ 	}
+ }
+ 
+@@ -2691,6 +2703,9 @@ pktgen_reset(port_info_t *info)
+ 	}
+ 
+ 	pktgen_update_display();
++
++	/* Reset RX duration measurements */
++	pktgen_info_rx_tv_reset(info);
+ }
+ 
+ /**************************************************************************//**
+diff --git a/app/pktgen-port-cfg.h b/app/pktgen-port-cfg.h
+index 5cc1017..984f354 100644
+--- a/app/pktgen-port-cfg.h
++++ b/app/pktgen-port-cfg.h
+@@ -10,6 +10,7 @@
+ 
+ #include <stdio.h>
+ #include <string.h>
++#include <sys/time.h>
+ #include <rte_version.h>
+ #include <rte_atomic.h>
+ #include <rte_spinlock.h>
+@@ -288,6 +289,11 @@ typedef struct port_info_s {
+     struct rte_eth_dev_info dev_info;     /**< PCI info + driver name */
+     char user_pattern[USER_PATTERN_SIZE]; /**< User set pattern values */
+     fill_t fill_pattern_type;             /**< Type of pattern to fill with */
++    struct timeval tx_start_tv;             /**< Measuring the time of transfer */
++    uint64_t tx_delay_sec;
++    struct timeval rx_start_tv;             /**< Measuring the time of transfer */
++    struct timeval rx_stop_tv;
++    uint64_t rx_cnt;
+ } port_info_t;
+ 
+ struct vxlan {
+diff --git a/app/pktgen.c b/app/pktgen.c
+index d2f7669..ce29ac2 100644
+--- a/app/pktgen.c
++++ b/app/pktgen.c
+@@ -1123,6 +1123,29 @@ pktgen_main_receive(port_info_t *info, uint8_t lid,
+ 	if ( (nb_rx = rte_eth_rx_burst(pid, qid, pkts_burst, nb_pkts)) == 0)
+ 		return;
+ 
++	/*
++	 * Do not count the case of ARP packets the are periodically incoming even
++	 * with no acutal testing transfer
++	 */
++	if (nb_rx > 1) {
++		/* Set info->rx_start_tv with a timestamp of the first valid packets */
++		if (info->rx_cnt == 0) {
++			gettimeofday(&(info->rx_start_tv), NULL);
++			/* Time of the next probe */
++			info->rx_cnt = rte_get_timer_cycles() + rte_get_timer_hz()/2;
++		}
++		/*
++		 * Refresh info->rx_stop_tv periodically as long as valid packets are
++		 * received
++		 */
++		if (info->rx_cnt <= rte_get_timer_cycles()) {
++			gettimeofday(&(info->rx_stop_tv), NULL);
++			/* Time of the next probe */
++			info->rx_cnt = rte_get_timer_cycles() + rte_get_timer_hz()/2;
++		}
++
++	}
++
+ 	qstats->rxpkts += nb_rx;
+ 	for(i = 0; i < nb_rx; i++)
+ 		qstats->rxbytes += rte_pktmbuf_data_len(pkts_burst[i]);
+@@ -1254,6 +1277,8 @@ pktgen_main_rxtx_loop(uint8_t lid)
+ 			pktgen_log_warning("*** port %u on socket ID %u has different socket ID on lcore %u socket ID %d\n",
+ 					pid, rte_eth_dev_socket_id(pid),
+ 					rte_lcore_id(), rte_socket_id());
++
++		pktgen_info_rx_tv_reset(infos[idx]);
+ 	}
+ 	while (pg_lcore_is_running(pktgen.l2p, lid)) {
+ 		for (idx = 0; idx < rxcnt; idx++)	/* Read Packets */
+diff --git a/app/pktgen.h b/app/pktgen.h
+index 8ee607b..98681ee 100644
+--- a/app/pktgen.h
++++ b/app/pktgen.h
+@@ -496,6 +496,14 @@ strdupf(char *str, const char *new) {
+ 	return (new == NULL) ? NULL : strdup(new);
+ }
+ 
++static inline void pktgen_info_rx_tv_reset(port_info_t *info)
++{
++	/* init values */
++	gettimeofday(&(info->rx_start_tv), NULL);
++	info->rx_stop_tv = info->rx_start_tv;
++	info->rx_cnt = 0;
++}
++
+ /**************************************************************************//**
+  *
+  * do_command - Internal function to execute a shell command and grab the output.
+-- 
+2.25.1
+

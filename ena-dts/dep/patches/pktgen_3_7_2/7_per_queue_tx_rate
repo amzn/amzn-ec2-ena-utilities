@@ -1,0 +1,290 @@
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: MIT-0
+
+diff --git a/app/pktgen-main.c b/app/pktgen-main.c
+index b91bcbe..efe982b 100644
+--- a/app/pktgen-main.c
++++ b/app/pktgen-main.c
+@@ -129,6 +129,24 @@ pktgen_usage(const char *prgname)
+ 		prgname);
+ }
+ 
++/* Return loop interval necessary to achieve expected Mbps rate */
++static void rates2intervals(port_info_t *info)
++{
++	uint64_t pkt_sz_bits, burst_sz_bits, bps;
++
++	pkt_sz_bits = 8ULL * pktgen_wire_size(info);
++	printf("~~~ pkt_sz_bits: %lu\n", pkt_sz_bits);
++	burst_sz_bits = info->tx_burst * pkt_sz_bits;
++	printf("~~~ tx_burst: %u\n", info->tx_burst);
++	printf("~~~ burst_sz_bits: %lu\n", burst_sz_bits);
++
++	for(int i=0; i<RTE_MAX_LCORE; i++) {
++		bps = info->tx_rates[i] * Million;
++		printf("~~~ bps: %lu\n", bps);
++		info->tx_interval[i] = burst_sz_bits * pktgen.hz / bps;
++		printf("\t\t[%u]: %u\n", i, pktgen.info[0].tx_interval[i]);
++	}
++}
+ /**************************************************************************//**
+  *
+  * pktgen_parse_args - Main parsing routine for the command line.
+@@ -153,6 +171,7 @@ pktgen_parse_args(int argc, char **argv)
+ 		{"no-crc-strip", 0, 0, 0},
+ 		{NULL, 0, 0, 0}
+ 	};
++	uint8_t q_provided = 0;
+ 
+ 	argvopt = argv;
+ 
+@@ -166,9 +185,14 @@ pktgen_parse_args(int argc, char **argv)
+ 	pktgen_set_hw_strip_crc(1);
+ 
+ 	pktgen.verbose = 0;
+-	while ((opt = getopt_long(argc, argvopt, "p:m:f:l:s:g:hPNGTv",
++	while ((opt = getopt_long(argc, argvopt, "q:p:m:f:l:s:g:hPNGTv",
+ 				  lgopts, &option_index)) != EOF)
+ 		switch (opt) {
++		case 'q':
++			if (!pg_parse_and_set_tx_rates(pktgen.info[0].tx_rates, optarg)) {
++				q_provided = 1;
++			}
++			break;
+ 		case 'p':
+ 			/* Port mask not used anymore */
+ 			break;
+@@ -272,6 +296,11 @@ pktgen_parse_args(int argc, char **argv)
+ 			return -1;
+ 		}
+ 
++	if (!q_provided) {
++		printf("The '-q' paramter not provided or with wrong arguments\n");
++		return -1;
++	}
++
+ 	/* Setup the program name */
+ 	if (optind >= 0)
+ 		argv[optind - 1] = prgname;
+@@ -458,6 +487,9 @@ main(int argc, char **argv)
+ 		pktgen_log_info("=== Display processing on lcore %d", rte_lcore_id());
+ 	}
+ 
++	/* Compute per-queue interval [cycles] based on user-provided rates */
++	rates2intervals(&pktgen.info[0]);
++
+ 	/* launch per-lcore init on every lcore except master and master + 1 lcores */
+ 	ret = rte_eal_mp_remote_launch(pktgen_launch_one_lcore, NULL, SKIP_MASTER);
+ 	if (ret != 0)
+diff --git a/app/pktgen-port-cfg.h b/app/pktgen-port-cfg.h
+index 07ba32c..ee6d8ee 100644
+--- a/app/pktgen-port-cfg.h
++++ b/app/pktgen-port-cfg.h
+@@ -263,6 +263,8 @@ typedef struct port_info_s {
+ 	pcap_info_t *pcap;	/**< PCAP information header */
+ 	pcap_info_t *pcaps[NUM_Q];	/**< Per Tx queue PCAP information headers */
+ 	uint64_t pcap_cycles;	/**< number of cycles for pcap sending */
++	uint32_t tx_rates[RTE_MAX_LCORE];	/**< Rates parsed from command-line */
++	uint32_t tx_interval[RTE_MAX_LCORE];	/** Computed Tx-burst intervals in cycles */
+ 
+ 	int32_t pcap_result;	/**< PCAP result of filter compile */
+ 	struct bpf_program pcap_program;/**< PCAP filter program structure */
+diff --git a/app/pktgen-stats.c b/app/pktgen-stats.c
+index 589d31a..f989883 100644
+--- a/app/pktgen-stats.c
++++ b/app/pktgen-stats.c
+@@ -240,34 +240,9 @@ pktgen_print_static_data(void)
+  * SEE ALSO:
+  */
+ void
+-pktgen_get_link_status(port_info_t *info, int pid, int wait)
++pktgen_get_link_status(port_info_t *info, __rte_unused int pid, __rte_unused int wait)
+ {
+-	int i;
+-	uint64_t prev_status = info->link.link_status;
+-
+-	/* get link status */
+-	for (i = 0; i < LINK_RETRY; i++) {
+-		memset(&info->link, 0, sizeof(info->link));
+-
+-		rte_eth_link_get_nowait(pid, &info->link);
+-
+-		if (info->link.link_status && info->link.link_speed) {
+-			if (prev_status == 0)
+-				pktgen_packet_rate(info);
+-			return;
+-		}
+-		if (!wait)
+-			break;
+-
+-		rte_delay_us_sleep(100 * 1000);
+-	}
+-
+-	/* Setup a few default values to prevent problems later. */
+-#if RTE_VERSION >= RTE_VERSION_NUM(17,2,0,0)
+-	info->link.link_speed   = ETH_SPEED_NUM_10G;
+-#else
+-	info->link.link_speed   = 10000;
+-#endif
++	info->link.link_speed   = 100000;
+ 	info->link.link_duplex  = ETH_LINK_FULL_DUPLEX;
+ }
+ 
+diff --git a/app/pktgen.c b/app/pktgen.c
+index 9aec235..01a1560 100644
+--- a/app/pktgen.c
++++ b/app/pktgen.c
+@@ -1232,6 +1232,7 @@ pktgen_main_rxtx_loop(uint8_t lid)
+ 	port_map_info(lid, infos, qids, &txcnt, &rxcnt, "RX/TX");
+ 
+ 	curr_tsc = rte_get_tsc_cycles();
++	infos[0]->tx_cycles = infos[0]->tx_interval[lid];
+ 	tx_next_cycle = rte_get_tsc_cycles() + infos[0]->tx_cycles;
+ 	tx_bond_cycle = rte_get_tsc_cycles() + rte_get_timer_hz()/10;
+ 
+@@ -1284,6 +1285,7 @@ pktgen_main_rxtx_loop(uint8_t lid)
+ 
+ 		/* Determine when is the next time to send packets */
+ 		if (curr_tsc >= tx_next_cycle) {
++			infos[0]->tx_cycles = infos[0]->tx_interval[lid];
+ 			tx_next_cycle = curr_tsc + infos[0]->tx_cycles;
+ 
+ 			for (idx = 0; idx < txcnt; idx++)	/* Transmit packets */
+@@ -1335,6 +1337,7 @@ pktgen_main_tx_loop(uint8_t lid)
+ 	port_map_info(lid, infos, qids, &txcnt, NULL, "TX");
+ 
+ 	curr_tsc = rte_get_tsc_cycles();
++	infos[0]->tx_cycles = infos[0]->tx_interval[lid];
+ 	tx_next_cycle = curr_tsc + infos[0]->tx_cycles;
+ 	tx_bond_cycle = curr_tsc + rte_get_timer_hz()/10;
+ 
+@@ -1376,6 +1379,7 @@ pktgen_main_tx_loop(uint8_t lid)
+ 
+ 		/* Determine when is the next time to send packets */
+ 		if (curr_tsc >= tx_next_cycle) {
++			infos[0]->tx_cycles = infos[0]->tx_interval[lid];
+ 			tx_next_cycle = curr_tsc + infos[0]->tx_cycles;
+ 
+ 			for (idx = 0; idx < txcnt; idx++) {	/* Transmit packets */
+diff --git a/lib/common/l2p.c b/lib/common/l2p.c
+index b3af274..d1ce98d 100644
+--- a/lib/common/l2p.c
++++ b/lib/common/l2p.c
+@@ -256,6 +256,93 @@ pg_parse_port_list(char *list, ps_t *ps)
+ 	return 0;
+ }
+ 
++/*
++ * Example arg usage:
++ * -q "3500.1-4:2000; 1,8-12 ,20 ,22:5000; 31: 7000"
++ */
++int
++pg_parse_and_set_tx_rates(uint32_t *tx_interval, char *str)
++{
++	uint32_t default_rate;
++	char buff[512];
++	char *p = NULL;
++	char *rate_groups[RTE_MAX_LCORE] = {NULL};
++	int k;
++
++	pg_strccpy(buff, str, " \r\n\t\"");
++
++	default_rate = strtol(buff, &p, 10);
++	if (default_rate == 0) {
++		printf("'-q': Wrong default rate\n");
++		goto rates_err;
++	}
++
++	/* First, set all intervals to default */
++	for(int i=0; i<RTE_MAX_LCORE; i++)
++		tx_interval[i] = default_rate;
++
++	if (*p == '\0') {
++		printf("'-q': No dot divider. Only default rate used.\n");
++		return 0;
++	}
++	if (*p++ != '.')
++		goto rates_err;
++
++	/* extract subranges of the same rate */
++	k = pg_strparse(p, ";", rate_groups, RTE_MAX_LCORE);
++	if (k<=0)
++		goto rates_err;
++
++	for(int i=0; i<k; i++) {
++		char *sep;
++		char *key_groups[RTE_MAX_LCORE] = {NULL};
++		uint32_t tx_rate;
++		int key_grp_cnt = 0;
++
++		sep = strchr(rate_groups[i], ':');
++		*sep++ = '\0';
++
++		/* parse value */
++		tx_rate = strtol(sep, NULL, 10);
++
++		/* parse keys */
++		key_grp_cnt = pg_strparse(rate_groups[i], ",", key_groups, RTE_MAX_LCORE);
++		for(int key_grp_id=0; key_grp_id < key_grp_cnt; key_grp_id++) {
++			uint8_t key_first, key_last;
++			char *delim = NULL;
++
++			key_first = strtoul(key_groups[key_grp_id], &delim, 10);
++			if (key_first >= RTE_MAX_LCORE) {
++				printf("Key value higher than %u\n", RTE_MAX_LCORE);
++				goto rates_err;
++			}
++
++			/* verify if a single key X or a range X-Y */
++			if (*delim == '\0') {
++				/* Set a single key */
++				tx_interval[key_first] = tx_rate;
++			} else if (*delim == '-') {
++				/* Set a range */
++				key_last = strtoul(delim+1, NULL, 10);
++				if (key_last >= RTE_MAX_LCORE) {
++					printf("Last key value higher than %u\n", RTE_MAX_LCORE);
++					goto rates_err;
++				}
++				for (uint8_t i_key = key_first; i_key<= key_last; i_key++)
++					tx_interval[i_key] = tx_rate;
++			} else {
++				goto rates_err;
++			}
++		}
++	}
++
++	return 0;
++
++rates_err:
++	printf("'-q': Parsing error. Bad arguments.\n");
++	return -1;
++}
++
+ /**************************************************************************//**
+  *
+  * pg_parse_matrix - Parse the command line argument for port configuration
+diff --git a/lib/common/l2p.h b/lib/common/l2p.h
+index 8eebe59..367b7b6 100644
+--- a/lib/common/l2p.h
++++ b/lib/common/l2p.h
+@@ -485,6 +485,7 @@ pg_dump_l2p(l2p_t *l2p)
+ 
+ void pg_port_matrix_dump(l2p_t *l2p);
+ int pg_parse_matrix(l2p_t *l2p, char *str);
++int pg_parse_and_set_tx_rates(uint32_t *tx_interval, char *str);
+ uint32_t pg_parse_portmask(const char *portmask);
+ 
+ #ifdef __cplusplus
+diff --git a/lib/utils/link.c b/lib/utils/link.c
+index 3b511ac..88c610a 100644
+--- a/lib/utils/link.c
++++ b/lib/utils/link.c
+@@ -27,6 +27,7 @@ get_link_status(uint16_t portid, struct rte_eth_link *link)
+ 	memset(link, 0, sizeof(struct rte_eth_link));
+ 
+ 	rte_eth_link_get_nowait(portid, link);
++	link->link_speed = 100000;
+ 
+ 	return link->link_status;
+ }

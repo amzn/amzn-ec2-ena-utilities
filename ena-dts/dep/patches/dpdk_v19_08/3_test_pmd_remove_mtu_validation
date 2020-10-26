@@ -1,0 +1,18 @@
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: MIT-0
+
+diff --git a/app/test-pmd/cmdline.c b/app/test-pmd/cmdline.c
+index 0415f5804..34cc130d3 100644
+--- a/app/test-pmd/cmdline.c
++++ b/app/test-pmd/cmdline.c
+@@ -2049,10 +2049,6 @@ cmd_config_mtu_parsed(void *parsed_result,
+ {
+ 	struct cmd_config_mtu_result *res = parsed_result;
+ 
+-	if (res->value < RTE_ETHER_MIN_LEN) {
+-		printf("mtu cannot be less than %d\n", RTE_ETHER_MIN_LEN);
+-		return;
+-	}
+ 	port_mtu_set(res->port_id, res->value);
+ }
+ 

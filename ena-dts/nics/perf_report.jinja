@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>{{ title }}</title>
+<style>
+table, th, td {
+    border: 1px solid black;
+    border-collapse: collapse;
+}
+th, td {
+    padding: 5px;
+    text-align: left; 
+    background-color: #33A1C9;  
+}
+</style>
+</head>
+
+<body>
+
+<div id="dpdk_info">
+<h2> DPDK Git Information </h2>
+<p> Branch: {{ git_info['branch'] }} </p>
+<p> commit: {{ git_info['commit'] }} </p>
+<p> Author: {{ git_info['author'] }} </p>
+<p> Date:   {{ git_info['date'] }} </p>
+<p> Summary: {{ git_info['summary'] }} </p>
+</div>
+
+<div id="nic_info">
+  <h2>NIC Detail Information</h2>
+  <table>
+    <tr>
+      <th>Item</th>
+      <th>Description</th>
+    </tr>
+    {% for key in nic_infos %}
+    <tr>
+      <td>{{ key }}</td>
+      <td>{{ nic_infos[key] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div id="test_result">
+  <h2>Test Result:</h2>
+  <table>
+    <tr>
+      <th>Frame_size(bytes)</th>
+      <th>Throughput(Mpps)</th>
+      <th>Line rate%</th>
+    </tr>
+    {% for result in test_results %}
+    <tr>
+      <td>{{ result[0] }}</td>
+      <td>{{ result[1] }}</td>
+      <td>{{ result[2] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div id="system_info">
+  <h2>Hardware and Software Ingredients</h2>
+  <table>
+    <tr>
+      <th>Item</th>
+      <th>Description</th>
+    </tr>
+    {% for key in system_infos %}
+    <tr>
+      <td>{{ key }}</td>
+      <td>{{ system_infos[key] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+
+</body>
+
+</html>

@@ -1,0 +1,87 @@
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: MIT-0
+
+diff --git a/ping-echo/ping-echo.c b/ping-echo/ping-echo.c
+index 7dd06b6..7031bee 100755
+--- a/ping-echo/ping-echo.c
++++ b/ping-echo/ping-echo.c
+@@ -25,7 +25,7 @@
+ 
+ static const struct rte_eth_conf port_conf_default = {
+ 	.rxmode = {
+-		.max_rx_pkt_len = ETHER_MAX_JUMBO_FRAME_LEN,
++		.max_rx_pkt_len = RTE_ETHER_MAX_JUMBO_FRAME_LEN,
+ #if RTE_VERSION < RTE_VERSION_NUM(18, 8, 0, 0)
+ 		.jumbo_frame = 1,
+ 		.ignore_offload_bitfield = 1,
+@@ -100,7 +100,7 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
+ 		return retval;
+ 
+ 	/* Display the port MAC address. */
+-	struct ether_addr addr;
++	struct rte_ether_addr addr;
+ 	rte_eth_macaddr_get(port, &addr);
+ 	printf("Port %u MAC: %02" PRIx8 ":%02" PRIx8 ":%02" PRIx8
+ 			   ":%02" PRIx8 ":%02" PRIx8 ":%02" PRIx8 "\n",
+@@ -118,38 +118,38 @@ port_init(uint16_t port, struct rte_mempool *mbuf_pool)
+ static inline void
+ swap_mac_ip(struct rte_mbuf *mbuf[], uint16_t n)
+ {
+-	struct ether_hdr *eth;
+-	struct ipv4_hdr *ip;
+-	struct icmp_hdr *icmp;
+-	struct ether_addr eth_addr;
++	struct rte_ether_hdr *eth;
++	struct rte_ipv4_hdr *ip;
++	struct rte_icmp_hdr *icmp;
++	struct rte_ether_addr eth_addr;
+ 	uint32_t ip_addr;
+ 	uint16_t i;
+ 	uint16_t cs;
+ 
+ 	for (i = 0; i < n; i++) {
+-		eth = rte_pktmbuf_mtod(mbuf[i], struct ether_hdr*);
+-		if (rte_be_to_cpu_16(eth->ether_type) != ETHER_TYPE_IPv4)
++		eth = rte_pktmbuf_mtod(mbuf[i], struct rte_ether_hdr*);
++		if (rte_be_to_cpu_16(eth->ether_type) != RTE_ETHER_TYPE_IPV4)
+ 			continue;
+ 
+-		ip = (struct ipv4_hdr*) &eth[1];
++		ip = (struct rte_ipv4_hdr*) &eth[1];
+ 		if (ip->next_proto_id != 0x01)
+ 			continue;
+ 
+ 		// swap MAC
+-		ether_addr_copy(&eth->s_addr, &eth_addr);
+-		ether_addr_copy(&eth->d_addr, &eth->s_addr);
+-		ether_addr_copy(&eth_addr, &eth->d_addr);
++		rte_ether_addr_copy(&eth->s_addr, &eth_addr);
++		rte_ether_addr_copy(&eth->d_addr, &eth->s_addr);
++		rte_ether_addr_copy(&eth_addr, &eth->d_addr);
+ 
+ 		// swap IP
+ 		ip_addr = ip->src_addr;
+ 		ip->src_addr = ip->dst_addr;
+ 		ip->dst_addr = ip_addr;
+ 
+-		icmp = (struct icmp_hdr*) &ip[1];
+-		icmp->icmp_type = IP_ICMP_ECHO_REPLY;
++		icmp = (struct rte_icmp_hdr*) &ip[1];
++		icmp->icmp_type = RTE_IP_ICMP_ECHO_REPLY;
+ 		cs = ~icmp->icmp_cksum & 0xffff;
+-		cs += ~htons(IP_ICMP_ECHO_REQUEST << 8) & 0xffff;
+-		cs += htons(IP_ICMP_ECHO_REPLY << 8);
++		cs += ~htons(RTE_IP_ICMP_ECHO_REQUEST << 8) & 0xffff;
++		cs += htons(RTE_IP_ICMP_ECHO_REPLY << 8);
+ 		cs = (cs & 0xffff) + (cs >> 16);
+ 		cs = (cs & 0xffff) + (cs >> 16);
+ 		icmp->icmp_cksum = ~cs;
+@@ -293,7 +293,7 @@ main(int argc, char *argv[])
+ 
+ 	/* Creates a new mempool in memory to hold the mbufs. */
+ 	mbuf_pool = rte_pktmbuf_pool_create("MBUF_POOL", NUM_MBUFS * nb_ports,
+-		MBUF_CACHE_SIZE, 0, ETHER_MAX_JUMBO_FRAME_LEN, rte_socket_id());
++		MBUF_CACHE_SIZE, 0, RTE_ETHER_MAX_JUMBO_FRAME_LEN, rte_socket_id());
+ 
+ 	if (mbuf_pool == NULL)
+ 		rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");

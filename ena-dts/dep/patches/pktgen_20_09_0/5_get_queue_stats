@@ -1,0 +1,175 @@
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: MIT-0
+
+diff --git a/app/lpktgenlib.c b/app/lpktgenlib.c
+index 9ae4484..f30cabd 100644
+--- a/app/lpktgenlib.c
++++ b/app/lpktgenlib.c
+@@ -23,6 +23,7 @@
+ #include <lua_utils.h>
+ 
+ #include "pktgen-cmds.h"
++#include "pktgen-stats.h"
+ #include <cli.h>
+ #include <luaconf.h>
+ #include <lualib.h>
+@@ -2918,6 +2919,31 @@ pktgen_portStats(lua_State *L)
+ 	return 1;
+ }
+ 
++static int
++pktgen_queueStats(lua_State *L)
++{
++	uint64_t p, rows=0;
++	int r;
++
++	switch (lua_gettop(L) ) {
++	case 0:
++		break;
++	default: return luaL_error(L, "queueStats, takes no arguments");
++	}
++
++	lua_newtable(L);
++
++	for (p = rte_eth_find_next_owned_by(pktgen.portNum, RTE_ETH_DEV_NO_OWNER);
++			(unsigned int)p < (unsigned int)RTE_MAX_ETHPORTS; p =
++			rte_eth_find_next_owned_by(p + 1, RTE_ETH_DEV_NO_OWNER)) {
++		r = pktgen_extract_qstats(L, p);
++		if (r>0)
++			rows += (uint64_t)r;
++	}
++
++	return 1;
++}
++
+ /**************************************************************************//**
+  *
+  * port_info - Return the other port stats for a given ports.
+@@ -3655,6 +3681,7 @@ static const luaL_Reg pktgenlib[] = {
+ 	{"pktStats",      pktgen_pktStats},		/* return the current packet stats on a port */
+ 	{"portStats",     pktgen_portStats},	/* return the current port stats */
+ 	{"portInfo",      pktgen_portInfo},		/* return the current port stats */
++	{"queueStats",    pktgen_queueStats},   /* return the current port stats */
+ 
+ 	{"run",           pktgen_run},			/* Load a Lua string or command file and execute it. */
+ 	{"continue",      pktgen_continue},		/* Display a message and wait for keyboard key and return */
+diff --git a/app/pktgen-stats.c b/app/pktgen-stats.c
+index ac9b717..9bd9e7c 100644
+--- a/app/pktgen-stats.c
++++ b/app/pktgen-stats.c
+@@ -7,6 +7,7 @@
+ /* Created 2010 by Keith Wiles @ intel.com */
+ 
+ #include <stdio.h>
++#include <string.h>
+ 
+ #include <pg_delay.h>
+ #include <lua_config.h>
+@@ -670,6 +671,84 @@ static struct xstats_info {
+     int cnt;
+ } xstats_info[RTE_MAX_ETHPORTS];
+ 
++/*
++ * Used by pktgen_queueStats to obtain the number of packets received by
++ * respective queues since the moment stats were zeroed (eg. when Pktgen
++ * starts) or the last time the function was called.
++ */
++int pktgen_extract_qstats(lua_State *L, uint64_t port_id)
++{
++	struct xstats_info *info;
++	int idx_xstat;
++
++	if (!rte_eth_dev_is_valid_port(port_id)) {
++		printf("Error: Invalid port number %lu\n", port_id);
++		return -1;
++	}
++
++	info = &xstats_info[port_id];
++
++	info->cnt = rte_eth_xstats_get_names(port_id, NULL, 0);
++	if (info->cnt  < 0) {
++		printf("Error: Cannot get count of xstats\n");
++		return -1;
++	}
++	if (info->cnt == 0)
++		return -1;
++
++	if (info->names == NULL) {
++		/* Get id-name lookup table */
++		info->names = malloc(sizeof(struct rte_eth_xstat_name) * info->cnt);
++		if (info->names == NULL) {
++			printf("Cannot allocate memory for xstats lookup\n");
++			return -1;
++		}
++		if (info->cnt != rte_eth_xstats_get_names(port_id, info->names, info->cnt)) {
++			printf("Error: Cannot get xstats lookup\n");
++			return -1;
++		}
++	}
++
++	/* Get stats themselves */
++	if (info->xstats == NULL) {
++		info->xstats = malloc(sizeof(struct rte_eth_xstat) * info->cnt);
++		if (info->xstats == NULL) {
++			printf("Cannot allocate memory for xstats\n");
++			return -1;
++		}
++		info->prev = malloc(sizeof(struct rte_eth_xstat) * info->cnt);
++		if (info->prev== NULL) {
++			printf("Cannot allocate memory for previous xstats\n");
++			return -1;
++		}
++		if (info->cnt != rte_eth_xstats_get(port_id, info->prev, info->cnt)) {
++			printf("Error: Unable to get prev_xstats\n");
++			return -1;
++		}
++	}
++	if (info->cnt != rte_eth_xstats_get(port_id, info->xstats, info->cnt)) {
++		printf("Error: Unable to get xstats\n");
++		return -1;
++	}
++	/* Put xstats to lua table */
++	for (idx_xstat = 0; idx_xstat < info->cnt; idx_xstat++) {
++		uint64_t value;
++		char *name = 0;
++
++		name = info->names[idx_xstat].name;
++		/* Skip values we are not interested in */
++		if (!strstr(name, "_cnt"))
++				continue;
++
++		value = info->xstats[idx_xstat].value - info->prev[idx_xstat].value;
++		lua_pushinteger(L, value);
++		lua_setfield(L, -2, name);
++	}
++	rte_memcpy(info->prev, info->xstats, sizeof(struct rte_eth_xstat) * info->cnt);
++
++	return idx_xstat;
++}
++
+ static void
+ _xstats_display(uint16_t port_id)
+ {
+diff --git a/app/pktgen-stats.h b/app/pktgen-stats.h
+index b7aa386..c1fca19 100644
+--- a/app/pktgen-stats.h
++++ b/app/pktgen-stats.h
+@@ -9,6 +9,7 @@
+ #define _PKTGEN_STATS_H_
+ 
+ #include <rte_timer.h>
++#include <lua_config.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -40,6 +41,7 @@ void pktgen_process_stats(struct rte_timer *tim, void *arg);
+ void pktgen_page_stats(void);
+ void pktgen_page_phys_stats(uint16_t pid);
+ void pktgen_page_xstats(uint16_t pid);
++int pktgen_extract_qstats(lua_State *L, uint64_t port_id);
+ 
+ #ifdef __cplusplus
+ }
+-- 
+2.25.1
+

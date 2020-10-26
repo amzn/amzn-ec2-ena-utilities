@@ -1,0 +1,16 @@
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+SPDX-License-Identifier: MIT-0
+
+diff --git a/ping-echo/ping-echo.c b/ping-echo/ping-echo.c
+index 7dd06b6..f09d275 100755
+--- a/ping-echo/ping-echo.c
++++ b/ping-echo/ping-echo.c
+@@ -17,7 +17,7 @@
+ 
+ #define PORT_ID 0
+ 
+-#define NUM_MBUFS 16383
++#define NUM_MBUFS 32767
+ #define MBUF_CACHE_SIZE 250
+ #define BURST_SIZE 32
+ 
