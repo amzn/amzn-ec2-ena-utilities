@@ -1,11 +1,10 @@
-## My Project
+## Utilities for AWS EC2 ENA NIC
 
-TODO: Fill this README out!
+This repository contains different utilities
+for the Elastic Network Adapter
 
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
+Each utility resides in a dedicated folder
+under the root directory.
 
 ## Security
 
