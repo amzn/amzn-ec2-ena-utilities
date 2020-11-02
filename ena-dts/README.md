@@ -278,15 +278,7 @@ command line parameters:
   * `--BW-interval` time between measurements,
   * `--BW-measurements` number of measurements.
 
-Sample test output:
-
-```
-+-----------+-----------------+----------------+----------------------+---------------------+
-| Tx queues | Rx on DUT, Mb/s | Rx on DUT, pps | Tx from Tester, Mb/s | Tx from Tester, pps |
-+===========+=================+================+======================+=====================+
-| 1         | 369             | 549957         | 568                  | 846375              |
-+-----------+-----------------+----------------+----------------------+---------------------+
-```
+Test output has the same format as `test_perf_bw`.
 
 Additional notes
 ================
