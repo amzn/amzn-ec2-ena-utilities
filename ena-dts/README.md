@@ -11,7 +11,7 @@ Prerequisites for testing:
      * Each needs to have two network interfaces - one for management and second for testing.
      * Each needs to have at least 4 cores.
      * Script should be able to perform `sudo` command without giving password.
-  * Host machine for executing dts:
+ * Host machine for executing dts:
      * Exchange of the SSH keys with DUT and Tester to allow ssh access without password.
 
 Below applications must be installed on host:
@@ -22,6 +22,7 @@ Below applications must be installed on host:
  * pexpect
  * xlrd
  * xlwt
+ * patch
 
 Network architecture
 ====================
@@ -46,6 +47,7 @@ Example setup that can be used for executing:
             |___________________________________________________________|
 
 ```
+
 The DUT (Device Under Test) and Tester machines are used for testing ENA DPDK driver.
 They should have two interfaces to do not lose communication with host while running tests.
 It is important to use different ports for management and tests, because when the interfaces
@@ -77,6 +79,7 @@ Setup configuration is placed in three files. Example configuration with comment
 conf/crbs.cfg
 -------------
 Configuration parameters necessary to access DUT and Tester from Host:
+
 ```
 # Setup name provided in the execution.cfg.
 [setup_name]
@@ -106,6 +109,7 @@ bypass_core0=True
 conf/ports.cfg
 --------------
 Configuration of ports used for tests.
+
 ```
 # Setup name provided in execution.cfg:
 [setup_name]
@@ -120,6 +124,7 @@ ports =
 # If needed, the static IPs could be provided:
 # ports =
 #    pci=0000:00:06.0,peer=0000:00:06.0,ip=10.0.0.2,peer_ip=10.0.0.1;
+```
 
 Please check the configuration before executing the tests.
 
@@ -131,6 +136,7 @@ This file configures DTS execution.
 It provides links to repositories, tags to checkout and set of patches to apply.
 
 `crbs` parameter should match setup_name from `conf/crbs.cfg` and `conf/ports.cfg`:
+
 ```
 # Name of setup configuration:
 crbs=setup_name
@@ -177,14 +183,18 @@ For each case scapy generates pcap file with packets.
 Then pktgen is executed on both DUT and Tester.
 
 Command:
+
 ```
 ./dts -t test_perf_bw
 ```
+
 runs BW test case with default configuration. It could by adjusted by adding
 command line parameters:
+
 ```
 ./dts -t test_perf_bw --BW-flows 1,8 --BW-sizes 1500,9000 --BW-types TCP,UDP --BW-queue 1 --BW-direction bi
 ```
+
 where:
   * `--BW-flows` list of number of flows,
   * `--BW-sizes` list of packet sizes,
@@ -242,9 +252,11 @@ test_perf_pcap
 Sends pcap from Tester to DUT and provides bandwidth statistics.
 
 Command:
+
 ```
 ./dts -t test_perf_pcap --BW-pcap-tester /absolute/path/to/ena_test.pcap
 ```
+
 runs pcap test case with default configuration. It could by adjusted by adding
 command line parameters:
 
@@ -253,6 +265,7 @@ command line parameters:
   * `--BW-measurements` number of measurements.
 
 Sample test output:
+
 ```
 +-----------+-----------------+----------------+----------------------+---------------------+
 | Tx queues | Rx on DUT, Mb/s | Rx on DUT, pps | Tx from Tester, Mb/s | Tx from Tester, pps |
