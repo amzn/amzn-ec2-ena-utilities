@@ -842,19 +842,19 @@ class Dut(Crb):
                 ipv6 = self.get_ipv6_address(dutPort)
                 if ipv6 == "Not connected":
                     if self.tester.ports_info[remotePort].has_key('ipv4'):
-			out = self.tester.send_ping(
-				dutPort, self.tester.ports_info[remotePort]['ipv4'],
-				self.get_mac_address(dutPort))
-		    else:
-                    	continue
-		else:
-                    if getattr(self, 'send_ping6', None):
-                    	out = self.send_ping6(
-                        	dutPort, self.tester.ports_info[remotePort]['ipv6'],
-                        	self.get_mac_address(dutPort))
+                        out = self.tester.send_ping(
+                            dutPort, self.tester.ports_info[remotePort]['ipv4'],
+                            self.get_mac_address(dutPort))
                     else:
-                    	out = self.tester.send_ping6(
-				remotePort, ipv6, self.get_mac_address(dutPort))
+                        continue
+                else:
+                    if getattr(self, 'send_ping6', None):
+                        out = self.send_ping6(
+                            dutPort, self.tester.ports_info[remotePort]['ipv6'],
+                            self.get_mac_address(dutPort))
+                    else:
+                        out = self.tester.send_ping6(
+                            remotePort, ipv6, self.get_mac_address(dutPort))
 
                 if ('64 bytes from' in out):
                     self.logger.info("PORT MAP: [dut %d: tester %d]" % (dutPort, remotePort))

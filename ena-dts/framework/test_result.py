@@ -30,6 +30,12 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 """
+ Changes made to the original file:
+   * Pass test cmdline arguments to the TestCase object
+   * Add set_precision() method
+"""
+
+"""
 Generic result container and reporters
 """
 import texttable    # text format
@@ -343,6 +349,9 @@ class ResultTable(object):
             self.rst.write_text('\n' + out + '\n\n')
         if self.logger:
             self.logger.info('\n' + out)
+
+    def set_precision(self, width):
+        self.table.set_precision(width)
 
 ###############################################################################
 ###############################################################################

@@ -365,7 +365,7 @@ class Tester(Crb):
                                     'type': pci_id,
                                     'intf': intf,
                                     'mac': macaddr,
-				    'ipv4': ipv4,
+                                    'ipv4': ipv4,
                                     'ipv6': ipv6})
 
             # return if port is not connect x3

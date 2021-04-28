@@ -167,6 +167,8 @@ def convert_ip2int(ip_str, ip_type):
 
     return ip_val
 
-def gen_pcap_fpath(port, i, p_dir):
-    return '{dir}/{id}_{sport}_{dport}_{nm}'.format(
-            dir=p_dir, id=i, nm=PCAP_FILENAME_SUFFIX, sport=port[0], dport=port[1])
+def gen_pcap_fpath(ports_pairs, i, p_dir):
+    output = '{dir}/{id}'.format(dir=p_dir, id=i)
+    for pp in ports_pairs:
+        output += '_{sport}_{dport}'.format(sport=pp[0], dport=pp[1])
+    return '{}_{}'.format(output, PCAP_FILENAME_SUFFIX)

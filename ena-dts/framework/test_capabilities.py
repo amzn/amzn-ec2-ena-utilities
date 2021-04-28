@@ -3,7 +3,7 @@
 Dict used to skip parts of tests if NIC is known not to support them
 """
 DRIVER_TEST_LACK_CAPA = {
-	'sctp_tx_offload' : ['thunder-nicvf', 'fm10k']
+    'sctp_tx_offload' : ['thunder-nicvf', 'fm10k']
 }
 
 

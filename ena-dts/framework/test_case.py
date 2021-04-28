@@ -36,6 +36,7 @@
    * Increase timeout of get_session_output to 1 second
    * Rework some of the logs
    * Add logs about test case running and current iteration
+   * Add result_table_set_precision() method
 """
 
 """
@@ -191,6 +192,9 @@ class TestCase(object):
 
     def result_table_getrows(self):
         return self._result_table.results_table_rows
+
+    def result_table_set_precision(self, width):
+        self._result_table.set_precision(width)
 
     def _get_functional_cases(self):
         """

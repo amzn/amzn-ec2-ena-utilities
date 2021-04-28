@@ -32,7 +32,7 @@
 """
  Changes made to the original file:
    * Add functions:
-     - tools_path
+     - devbind_path
      - config_ports
      - free_ports
    * Add class LatencyGenerator
@@ -52,6 +52,7 @@
      - quit
      - __kill_parent
      - end
+     - __autodetect_tx_rates
    * Rework packet_generator method of the SoftwarePacketGenerator
 """
 
@@ -64,60 +65,41 @@ from ssh_connection import SSHConnection
 from settings import SCAPY2IXIA, latency_echo, latency_send, latency_app
 from settings import load_global_setting, HOST_DRIVER_SETTING
 from settings import HOST_DRIVER_MODE_SETTING
+from settings import AUTO_QUEUE_TX_RATE
 from logger import getLogger
 from exception import VerifyFailure
 from utils import create_mask, gen_pcap_fpath
 
 
-def tools_path(tester, prompt):
-    out = tester.send_expect("ls usertools", prompt)
-    return "usertools" if "No such" not in out else "tools"
+def devbind_path(host, prompt):
+    devbind_dir = host.send_expect("find . -name dpdk-devbind.py", prompt)
+    assert devbind_dir, "Cannot find dpdk-devbind.py executable"
+
+    return devbind_dir.splitlines()[0]
 
 
-def config_ports(tester, prompt, ports):
+def config_ports(host, prompt, ports):
     drivername = load_global_setting(HOST_DRIVER_SETTING)
-    drivermode = load_global_setting(HOST_DRIVER_MODE_SETTING)
-    if drivername == "igb_uio":
-        wc = "wc_activate=1" if drivermode == "wc" else ""
-        tester.send_expect("modprobe uio", prompt)
-        tester.send_expect("rmmod igb_uio", prompt)
-        tester.send_expect(
-            "insmod ./x86_64-native-linuxapp-gcc/build/"
-            "lib/librte_eal/linuxapp/igb_uio/igb_uio.ko {}".format(wc), prompt)
-        tester.send_expect(
-            "insmod ./x86_64-native-linuxapp-gcc/kmod/igb_uio.ko"
-            " {}".format(wc), prompt)
-        tester.send_expect(
-            "insmod ./x86_64-native-linuxapp-gcc/kernel/linux/igb_uio/igb_uio.ko"
-            " {}".format(wc), prompt)
-    elif drivername == "vfio-pci":
-        tester.send_expect("modprobe vfio-pci", prompt)
-        if drivermode == "noiommu":
-            tester.send_expect(
-                "echo 1 > "
-                "/sys/module/vfio/parameters/enable_unsafe_noiommu_mode",
-                prompt)
 
     bind_cmd = ""
     for port in ports:
-        bind_cmd += " %s" % tester.ports_info[port]['pci']
-        tester.send_expect("ifconfig {} down".format(
-            tester.ports_info[port]['intf']), prompt)
+        bind_cmd += " %s" % host.ports_info[port]['pci']
+        host.send_expect("ifconfig {} down".format(
+            host.ports_info[port]['intf']), prompt)
 
-    tools = tools_path(tester, prompt)
-    tester.send_expect("./{}/dpdk-devbind.py --bind={} {}".
-                            format(tools, drivername, bind_cmd), prompt)
+    devbind = devbind_path(host, prompt)
+    host.send_expect("{} --bind={} {}".format(
+        devbind, drivername, bind_cmd), prompt)
 
-    tester.setup_memory(16384)
+    host.setup_memory(16384)
 
 
-def free_ports(tester, prompt, ports):
+def free_ports(host, prompt, ports):
     bind_cmd = ""
     for port in ports:
-        bind_cmd += " %s" % tester.ports_info[port]['pci']
-    tools = tools_path(tester, prompt)
-    com = "./{}/dpdk-devbind.py --bind=ena {}".format(tools, bind_cmd)
-    tester.send_expect(com, prompt)
+        bind_cmd += " %s" % host.ports_info[port]['pci']
+    devbind = devbind_path(host, prompt)
+    host.send_expect("{} --bind=ena {}".format(devbind, bind_cmd), prompt)
 
 
 class LatencyGenerator:
@@ -180,22 +162,23 @@ class SoftwarePacketGenerator():
     PROMPT_PKTGEN = "Pktgen:/>"
     NOT_USED_CPUS = 3
     MEMORY = 2000
+    RE_QSTATS = re.compile(r'.*(tx|rx)_q(\d+)_(cnt|bytes).*= (\d+),')
 
     """
     Software WindRiver packet generator for performance measurement.
     """
 
-    def __init__(self, tester, pktgen_dir=None):
-        self.tester = tester
+    def __init__(self, host, pktgen_dir=None):
+        self.host = host
         self.pktgen_dir = pktgen_dir if pktgen_dir is not None \
-            else self.tester.pktgen_dir
+            else self.host.pktgen_dir
         self.port_configured = False
         self.bind_cmd = ""
         self.on = False
         self.ports = []
 
     def send(self, command, timeout=500):
-        return self.tester.send_expect(command, self.PROMPT_PKTGEN, timeout)
+        return self.host.send_expect(command, self.PROMPT_PKTGEN, timeout)
 
     def packet_generator(self, portList, rate_percent):
         self.init(portList, rate_percent)
@@ -209,12 +192,12 @@ class SoftwarePacketGenerator():
     # to run an actual traffic.
     # flows - specifies the number of generated pcap files, 0 for the first
     # case.
-    def init(self, rx_port, tx_port, conf_d, rate_percent, ports_list=None):
+    def init(self, rx_port, tx_port, conf_d, rate_percent, flow_list=None):
 
-        if ports_list is None:
-            flows = 0
+        if flow_list is None:
+            flows_nb = 0
         else:
-            flows = len(ports_list)
+            flows_nb = len(flow_list)
         tx_ports = []
 
         f_pcap = conf_d['f_pcap']
@@ -236,37 +219,40 @@ class SoftwarePacketGenerator():
 
         if not self.port_configured:
             # Rebind the card to other interface
-            config_ports(self.tester, self.PROMPT_SYSTEM, self.ports)
+            config_ports(self.host, self.PROMPT_SYSTEM, self.ports)
             self.port_configured = True
 
         # assgin core for ports
         port_index = range(len(self.ports))
         port_map = dict(zip(self.ports, port_index))
-        self.tester.init_reserved_core()
+        self.host.init_reserved_core()
 
-        cpu = self.tester.get_cpu_number()
+        cpu = self.host.get_cpu_number()
         # One core for pktgen management, two cores for Linux to ensure
         # better system stability.
         cpu -= self.NOT_USED_CPUS
 
         # Increase maximum number of open files:
-        self.tester.send_expect("ulimit -n 32768", self.tester.prompt)
+        self.host.send_expect("ulimit -n 32768", self.host.prompt)
 
         if cpu <= 0:
             raise VerifyFailure("Not enough cores for performance!!!")
 
-        # flows == 0 means we are preparing pcap files, not using them
+        # flows_nb == 0 means we are preparing pcap files, not using them
         _q = q_nb
-        if flows != 0:
-            _q = min(q_nb, flows)
+        if flows_nb != 0:
+            _q = min(q_nb, flows_nb)
 
+        tx_lcore_start = 1
         if mode == "bi":
             _q = min(cpu/2, _q)
             if _q == 0:
                 map_cmd = "\"[1:1].[0]\""
                 _q = 1
             else:
-                map_cmd = "\"[1-{}:{}-{}].[0]\"".format(_q, _q+1, 2*_q)
+                tx_lcore_start = _q + 1
+                tx_lcore_end = 2 * _q
+                map_cmd = "\"[1-{}:{}-{}].[0]\"".format(_q, tx_lcore_start, tx_lcore_end)
         else:
             _q = min(cpu, _q)
             if mode == "tx":
@@ -278,14 +264,14 @@ class SoftwarePacketGenerator():
         pcap_cmd = ""
         if f_pcap is not None:
             if tx_flow:
-                assert ports_list is not None, "Ports list not known"
+                assert flow_list is not None, "Flow list not known"
                 pcap_cmd += "-s {}:".format(port_map[tx_port])
 
                 if pcap_cmd_cb is None:
                     _d = conf_d['d_pcap']
-                    for i in range(flows):
+                    for i in range(flows_nb):
                         pcap_cmd += "../{},".format(
-                                gen_pcap_fpath(ports_list[i], i, _d))
+                                gen_pcap_fpath(flow_list[i], i, _d))
                     else:
                         # remove the trailing comma
                         pcap_cmd = pcap_cmd[:-1]
@@ -294,12 +280,23 @@ class SoftwarePacketGenerator():
                     pcap_cmd += pcap_cmd_cb()
 
         # Selected 2 for -n to optimize results on Burage
-        cores_mask = create_mask(self.tester.get_core_list("all"))
+        cores_mask = create_mask(self.host.get_core_list("all"))
 
-        self.tester.send_expect("cd {}".format(self.pktgen_dir), "#")
+        self.host.send_expect("cd {}".format(self.pktgen_dir), "#")
 
-        pktgen_dir = self.tester.send_expect("find . -name pktgen", "#")
+        pktgen_dir = self.host.send_expect("find . -name pktgen", "#")
         assert pktgen_dir, "Cannot find pktgen executable."
+
+        tx_rates = conf_d["tx_rates"]
+        if tx_rates == AUTO_QUEUE_TX_RATE :
+            tx_rates = self.__autodetect_tx_rates(conf_d, flows_nb)
+        elif isinstance(tx_rates, list):
+            default_rate = self.__autodetect_tx_rates(conf_d, flows_nb)
+            tx_rates_str = "{}.".format(default_rate)
+            for (qid, rate) in zip(range(q_nb), tx_rates):
+                # Rate is being set per lcore - first Tx lcore can vary
+                tx_rates_str += "{}:{:.0f};".format(qid + tx_lcore_start, rate)
+            tx_rates = tx_rates_str
 
         # In case build system created multiple pktgen executables,
         # use only the first one.
@@ -307,7 +304,7 @@ class SoftwarePacketGenerator():
         pktgen_cmd = "{} --log-level 1 -n 4 --proc-type auto " \
             "-m {} -- -P -m {} {} ".format(pktgen_dir, self.MEMORY, map_cmd,
                     pcap_cmd)
-	pktgen_cmd += "-q \"{}\"".format(conf_d['tx_rates'])
+        pktgen_cmd += "-q \"{}\"".format(tx_rates)
 
         self.send(pktgen_cmd)
 
@@ -352,7 +349,34 @@ class SoftwarePacketGenerator():
     def queue_stats(self):
         get_stats = "lua \"prints('', pktgen.queueStats())\""
         out = self.send(get_stats)
-        return out
+
+        txq_stats = {}
+        rxq_stats = {}
+        for l in out.split("\r\n"):
+            res = self.RE_QSTATS.match(l)
+            if not res:
+                continue
+            # Queue type: "tx" or "rx'
+            qtype = res.group(1)
+            # ID of the queue
+            qid = int(res.group(2))
+            # Stat type: "cnt" or "bytes"
+            stat_type = res.group(3).encode("utf-8")
+            # And the value
+            value = int(res.group(4))
+
+            if qtype == "tx":
+                if qid in txq_stats:
+                    txq_stats[qid][stat_type] = value
+                else:
+                    txq_stats[qid] = {stat_type: value}
+            else:
+                if qid in rxq_stats:
+                    rxq_stats[qid][stat_type] = value
+                else:
+                    rxq_stats[qid] = {stat_type: value}
+
+        return (txq_stats, rxq_stats)
 
     def pkt_counts(self):
         get_s = "lua \"prints('portStats', pktgen.portStats('all', 'port'));\""
@@ -383,18 +407,18 @@ class SoftwarePacketGenerator():
     def quit(self):
         if self.on:
             self.on = False
-            self.tester.send_expect("quit", self.PROMPT_SYSTEM)
-            self.tester.send_expect("stty -echo", self.PROMPT_SYSTEM)
-            self.tester.send_expect("cd {}".format(self.tester.base_dir), self.PROMPT_SYSTEM)
+            self.host.send_expect("quit", self.PROMPT_SYSTEM)
+            self.host.send_expect("stty -echo", self.PROMPT_SYSTEM)
+            self.host.send_expect("cd {}".format(self.host.base_dir), self.PROMPT_SYSTEM)
 
     def __kill_parent(self):
-        self.tester.kill_all()
-        super(type(self.tester), self.tester).kill_all()
+        self.host.kill_all()
+        super(type(self.host), self.host).kill_all()
 
     def end(self):
-        free_ports(self.tester, self.PROMPT_SYSTEM, self.ports)
+        free_ports(self.host, self.PROMPT_SYSTEM, self.ports)
         self.__kill_parent()
-        self.tester.restore_interfaces()
+        self.host.restore_interfaces()
         self.port_configured = False
 
     def throughput(self, portList, rate_percent=100):
@@ -405,6 +429,17 @@ class SoftwarePacketGenerator():
         (bps_rx, bps_tx, _, _) = self.packet_generator(portList, ratePercent)
         assert bps_tx != 0
         return (float(bps_tx) - float(bps_rx)) / float(bps_tx)
+
+    def __autodetect_tx_rates(self, conf_d, flows_nb):
+        max_mbps = conf_d["max_gbps"] * 1000
+        # Add 10% margin if some queues won't be able to finish it's request
+        # fast enough
+        bw_margin = max_mbps / 10
+
+        # Spread the BW across each flow equally
+        tx_rates = (max_mbps + bw_margin) / flows_nb
+
+        return str(tx_rates)
 
 
 class IxiaPacketGenerator(SSHConnection):

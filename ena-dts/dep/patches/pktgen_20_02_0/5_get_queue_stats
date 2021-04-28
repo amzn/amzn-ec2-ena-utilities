@@ -135,7 +135,7 @@ index 1da292e..9161167 100644
 +
 +		name = info->names[idx_xstat].name;
 +		/* Skip values we are not interested in */
-+		if (!strstr(name, "_cnt"))
++		if (!strstr(name, "_cnt") && !strstr(name, "_bytes"))
 +				continue;
 +
 +		value = info->xstats[idx_xstat].value - info->prev[idx_xstat].value;

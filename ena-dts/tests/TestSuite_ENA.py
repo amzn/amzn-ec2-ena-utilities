@@ -68,17 +68,15 @@
      - get_queue_stats
      - __find_active_queue
      - __detect_one_flow
-     - generate_ports_list
+     - generate_flows_list
      - create_pktgen_flows
      - __test_perf_bw
-     - get_ports_filename
-     - save_ports
-     - load_ports_from_file
+     - get_flows_filename
+     - save_flows
+     - load_flows_from_file
      - test_perf_bw
-     - init_dut_instance
      - init_pktgen_instances
      - mono_traffic
-     - mono_traffic_reverse
      - bi_traffic
      - parse_stress
      - generate_pcap_execute
@@ -93,9 +91,11 @@
      - find_existing_pcaps
      - generate_pcap_string
      - get_pcap_dirnm
+     - detect_best_rates
   * Rework tear_down() and tear_down_all() methods to perform additional cleanup
     required by the test suite
 """
+from __future__ import division
 import time
 import re
 import json
@@ -103,7 +103,8 @@ import os
 import ast
 from test_case import TestCase
 from pmd_output import PmdOutput
-from settings import HEADER_SIZE, PROTOCOL_PACKET_SIZE, DEFAULT_QUEUE_TX_RATE
+from settings import HEADER_SIZE, PROTOCOL_PACKET_SIZE
+from settings import AUTO_QUEUE_TX_RATE, DEFAULT_QUEUE_TX_RATE
 from settings import PCAP_DIR, PCAP_TESTER, PCAP_DUT, PCAP_FILENAME_SUFFIX
 from etgen import SoftwarePacketGenerator, LatencyGenerator
 from project_dpdk import copy_pcap
@@ -174,7 +175,7 @@ class TestENA(TestCase):
         for flag in self.TESTPMD_FLAGS:
             if flag in help:
                 self.testpmd_flags += flag + " "
-	self.pmd_on = False
+        self.pmd_on = False
 
         self.pktgen_tester = SoftwarePacketGenerator(self.tester)
         self.pktgen_dut = SoftwarePacketGenerator(self.dut)
@@ -183,22 +184,12 @@ class TestENA(TestCase):
         self.latency_echo = LatencyGenerator(self.dut, [self.port_dut], self.icmp_dut_q)
         self.test_configs_copy = self.test_configs
 
-        self.dut_instance_type = self.dut.check_instance_type()
-        self.tester_instance_type = self.tester.check_instance_type()
-        self.dut_ncpu = self.dut.get_cpu_number()
-        self.tester_ncpu = self.tester.get_cpu_number()
+        dut_ncpu = self.dut.get_cpu_number()
+        tester_ncpu = self.tester.get_cpu_number()
 
-        ntype = re.compile("[a-zA-Z]\d[a-zA-Z]*n\.\w*")
-        is_dut_ntype = ntype.match(self.dut_instance_type) is not None
-        is_tester_ntype = ntype.match(self.tester_instance_type) is not None
-        if is_dut_ntype and is_tester_ntype:
-            self.max_queue = min(self.MAX_QUEUE_N_TYPE,
-                    self.dut_ncpu - SoftwarePacketGenerator.NOT_USED_CPUS,
-                    self.tester_ncpu - SoftwarePacketGenerator.NOT_USED_CPUS)
-        else:
-            self.max_queue = min(self.MAX_QUEUE_DEFAULT,
-                    self.dut_ncpu - SoftwarePacketGenerator.NOT_USED_CPUS,
-                    self.tester_ncpu - SoftwarePacketGenerator.NOT_USED_CPUS)
+        self.max_queue = min(self.dut.max_io_queue, self.tester.max_io_queue,
+                             dut_ncpu - SoftwarePacketGenerator.NOT_USED_CPUS,
+                             tester_ncpu - SoftwarePacketGenerator.NOT_USED_CPUS)
 
     def check_ports(self, status=True):
         """
@@ -267,37 +258,33 @@ class TestENA(TestCase):
     # probing packets are received, few ARP packets could mislead the
     # measurement and suggest that a wrong queue belongs to the flow. An
     # arbitrarily large `n_min protects against that.
-    def __find_active_queue(self, lua_table, n_min=0):
-        # self.logger.info(lua_table)
-        found = 0
+    def __find_active_queue(self, rxq_stats, n_min=0):
+        found = False
 
-	for l in lua_table.splitlines():
-	    res = self.active_que_re.match(l)
-	    if res is not None:
-	        pkts_cnt = int(res.group(2))
-	        if pkts_cnt > n_min:
-                    found += 1
-                    if found == 1:
-                        qid = int(res.group(1))
-                    else:
-                        raise FlowDetectionException(
-                                FlowDetectionException.MULTIPLE_HITS)
-        else:
-            if found == 0:
-                # This can possibly happen if statistics are read too quickly.
-                raise FlowDetectionException(FlowDetectionException.ZERO_HITS)
+        for (qid, qstats) in rxq_stats.items():
+            pkts_cnt = qstats["cnt"]
+            if pkts_cnt > n_min:
+                if found:
+                    raise FlowDetectionException(FlowDetectionException.MULTIPLE_HITS)
+                found = True
+                out_qid = qid
 
-        return qid
+        if not found:
+            # This can possibly happen if statistics are read too quickly.
+            raise FlowDetectionException(FlowDetectionException.ZERO_HITS)
+
+        return out_qid
 
 
-    def __detect_one_flow(self, t_gen, d_gen, t_cmd, dport, send=True):
-        t_crb = t_gen.tester
+    def __detect_one_flow(self, tx_gen, rx_gen, tx_cmd, ports_pair, send=True):
+        tx_crb = tx_gen.host
 
         if send:
-            t_crb.scapy_send(t_cmd)
+            tx_crb.scapy_send(tx_cmd)
 
         try:
-            queue_id = self.__find_active_queue(d_gen.queue_stats())
+            (_, rxq_stats) = rx_gen.queue_stats()
+            queue_id = self.__find_active_queue(rxq_stats)
 
         except FlowDetectionException as fde:
             if fde.state == FlowDetectionException.MULTIPLE_HITS:
@@ -308,10 +295,10 @@ class TestENA(TestCase):
                     # actually forms a flow. Rarely happens but not an error. Eg.
                     # ARP packets are incoming occasionally and spoil the result.
                     self.detect_loop_ttl -= 1
-                    return self.__detect_one_flow(t_gen, d_gen, t_cmd, dport)
+                    return self.__detect_one_flow(tx_gen, rx_gen, tx_cmd, ports_pair)
                 else:
                     assert 0, "Multiple queues receive packets too often." \
-                            "DUT port: %s" % dport
+                            "Ports: %s" % ports
             elif fde.state == FlowDetectionException.ZERO_HITS:
                 self.logger.info("Zero HITS, ttl: %s" %
                         self.detect_loop_ttl)
@@ -319,122 +306,125 @@ class TestENA(TestCase):
                     # Do not resend packets, only try to read statistics once
                     # again. Maybe previous probe was done before they arrived.
                     self.detect_loop_ttl -= 1
-                    return self.__detect_one_flow(t_gen, d_gen, t_cmd, dport,
+                    return self.__detect_one_flow(tx_gen, rx_gen, tx_cmd, ports_pair,
                             send=False)
                 else:
-                    assert 0, "No queues received packets. DUT port: %s" % port
+                    assert 0, "No queues received packets. Ports: %s" % ports_pair
         # All good
         else:
             return queue_id
 
-    def generate_ports_list(self, dut_conf, tester_conf, total_queues,
-            direction):
-        # After this function the dut/tester_conf['queue_nb'] will be no higher
+    def generate_flows_list(self, tx_conf, rx_conf, total_queues, direction, flow_nb):
+        # After this function the tx/rx_conf['queue_nb'] will be no higher
         # than `total_queues`. It can be limited by the nb of CPUs on an
         # instance. For `bi` direction it is limited by the half of CPU amount
         # (half for Tx, half for Rx). Pktgen is launched in a passive mode just
-        # to observe the association between ports and queues.
-        self.init_dut_instance(dut_conf, total_queues)
-        self.logger.info("Requested DUT queues: %s, available: %s" %
-                (total_queues, dut_conf['queue_nb']))
+        # to observe the association between flows and queues.
+        rx_conf['tx_rates'] = DEFAULT_QUEUE_TX_RATE
+        f_pcap = rx_conf['f_pcap']
+        # Rx pktgen instance shouldn't use any pcaps - force it to do so, by
+        # setting f_pcap field as None
+        rx_conf['f_pcap'] = None
+        rx_conf['queue_nb'] = TestENA.init_pktgen_instance(rx_conf)
+        time.sleep(2)
 
-        ports = self.create_pktgen_flows(tester_conf, dut_conf)
-        self.tester.send_expect("^C", "")
-        self.tester.scapy_exit()
-        self.pktgen_dut.quit()
-        self.pktgen_dut.end()
-        self.save_ports(ports)
+        flows = self.create_pktgen_flows(tx_conf, rx_conf, flow_nb)
 
-        return ports
+        tx_host = tx_conf['host']
+        rx_gen = rx_conf['pktgen']
+
+        tx_host.send_expect("^C", "")
+        tx_host.scapy_exit()
+        rx_gen.quit()
+        rx_gen.end()
+
+        # Revert the old value f_pcap value
+        rx_conf['f_pcap'] = f_pcap
+
+        self.save_flows(flows, tx_host, rx_conf['host'])
+
+        return flows
 
     # Sends packets from Tx side to consequtive port numbers of Rx side. For
     # each, it observes which queue received the traffic and records that. The
-    # goal is to find a set of ports allowing to occupy all queues available on
-    # Rx, that is to create the number of `wanted` distinctive flows.
-    # Nevertheless, it can be limited by the `d_conf[queue_nb]` number of
-    # queues oferred by HW.
-    def create_pktgen_flows(self, tx_conf, rx_conf):
-        # pre-compile the pattern
-        self.active_que_re = re.compile(r'.*[q](\d+).*= (\d+),')
+    # goal is to find a set of flows allowing to occupy all queues available on
+    # Rx, that is to create the number of `flow_nb` distinctive flows.
+    def create_pktgen_flows(self, tx_conf, rx_conf, flow_nb):
         self.detect_loop_ttl = 10                       # chosen arbitrarily
         self.flow_npackets = 100
-        self.flow_detect_min = self.flow_npackets/2     # chosen arbitrarily
         port_min = int(self.test_configs['BW_port_min'])
         port_max = int(self.test_configs['BW_port_max'])
 
         # Instances of SoftwarePacketGenerator
-        rx_gen = rx_conf['instance']
-        tx_gen = tx_conf['instance']
+        rx_gen = rx_conf['pktgen']
+        tx_gen = tx_conf['pktgen']
         # Instances of DPDKDut/DPDKTester
-        rx_crb = rx_gen.tester     # an unfortunate member name
-        tx_crb = tx_gen.tester
+        rx_host = rx_conf['host']
+        tx_host = tx_conf['host']
 
         # Do not rely on self.max_queues value as it may no longer be valid
         # there. It can be modified if the test case if bidirectional and the
         # instance is lacking CPU's.
         rxq_num = rx_conf['queue_nb']
-        q_to_port = [None] * rxq_num;
-        _rx_ports = [None] * rxq_num
+        q_to_port = [None] * rxq_num
+        flows_per_queue = flow_nb // rxq_num
+        flows_nb_rest = flow_nb % rxq_num
 
         assert (port_min + rxq_num - 1) <= port_max, "Port range is too small"
 
         # Make sure Tx uses standard Linux driver
         tx_gen.end()
-        self.logger.info("Pktgen flows creation: ")
+        tx_host.logger.info("Pktgen flows creation:")
 
-        tx_iface = tx_crb.ports_info[tx_crb.used_port]['intf']
+        tx_iface = tx_host.ports_info[tx_host.used_port]['intf']
         tx_cmd = 'send([IP(dst="{dip}")/' \
-          'TCP(sport={{sport}}, dport={{dport}})/' \
+          'UDP(sport={{sport}}, dport={{dport}})/' \
           'Raw(load="P" * 100)] * {n}, iface="{iface}")'.format(
-            dip=rx_crb.ports_info[rx_crb.used_port]['ipv4'],
+            dip=rx_host.ports_info[rx_host.used_port]['ipv4'],
             n=self.flow_npackets, iface=tx_iface)
 
         # Init scapy on tester to periodically send packets
-        tx_crb.scapy_run()
-        tx_crb.scapy_send("conf.iface='{}'".format(tx_iface))
+        tx_host.scapy_run()
+        tx_host.scapy_send("conf.iface='{}'".format(tx_iface))
         # Discard first stats read, just to zeroize them.
         rx_gen.queue_stats()
 
         # Find required amount of queues forming unique flows.
-        rx_port = port_min
-        tx_port = port_min
-        wanted = rxq_num
+        dst_port = port_min
+        src_port = port_min
+        wanted = flow_nb
         while wanted > 0:
             queue_id = self.__detect_one_flow(tx_gen, rx_gen,
-                    tx_cmd.format(dport=rx_port, sport=tx_port), rx_port)
+                    tx_cmd.format(dport=dst_port, sport=src_port), dst_port)
 
             assert queue_id is not None
 
-            if q_to_port[queue_id] is None:
-                q_to_port[queue_id] = [rx_port, tx_port]
+            q_flow_nb = 0 if q_to_port[queue_id] is None else len(q_to_port[queue_id])
+            if q_flow_nb < flows_per_queue or \
+               (queue_id < flows_nb_rest and q_flow_nb < (flows_per_queue + 1)):
                 wanted -= 1
-                self.logger.info("Port pair: ({}, {}) associated with queue: {}".format(
-                    tx_port, rx_port, queue_id))
+                if q_to_port[queue_id] is None:
+                    q_to_port[queue_id] = [[src_port, dst_port]]
+                else:
+                    q_to_port[queue_id].append([src_port, dst_port])
+                self.logger.info("Queue[{:02}]: Associated port pair {} (src_port={}, dst_port={})".format(
+                    queue_id, q_flow_nb + 1, src_port, dst_port))
             else:
-                self.logger.info("Queue {} already occupied. Looking for another one".format(
+                self.logger.info("Queue[{:02}]: Already occupied. Looking for another one".format(
                         queue_id))
-                # Change Tx port only on failure
-                tx_port = port_min if tx_port > port_max else tx_port + 1
-            # Change Rx port each time
-            rx_port = port_min if rx_port > port_max else rx_port + 1
+                # Change source port only on failure
+                src_port = port_min if src_port > port_max else src_port + 1
+            # Change destination port each time
+            dst_port = port_min if dst_port > port_max else dst_port + 1
 
         flows = filter(lambda p: p is not None, q_to_port)
 
-        if wanted != 0:
-            self.logger.error("Less than %s flows detected! Expect lower bandwidth" % wanted)
-            found = len(flows)
-            for i in range(found, rxq_num):
-                flows[i] = flows[ i%found ]
-
-        # Now pass only `wanted` number of useful ports
-        assert len(flows) == rxq_num, \
-            "Number of destination ports is wrong"
-        tx_crb.scapy_exit()
+        tx_host.scapy_exit()
         # Prepare a list of lists to be identical to json.loads() (used
         # further) output
         return flows
 
-    def __test_perf_bw(self, ports=None, stress=None):
+    def __test_perf_bw(self, flows=None, stress=None):
         # Validate pkt_sizes
         try:
             pkt_sizes = [int(size) for size in self.test_configs["BW_size"].split(",")]
@@ -459,9 +449,9 @@ class TestENA(TestCase):
             self.verify(0, "Wrong number of queues")
         # Get the list of requested number of flows
         if self.test_configs["BW_flows"] == "AUTO":
-            flow_list = [1, total_queues]
+            flows_nb_list = [1, total_queues]
         else:
-            flow_list = self.test_configs["BW_flows"].split(",")
+            flows_nb_list = [int(x) for x in self.test_configs["BW_flows"].split(",")]
         # Validate interval
         try:
             interval = int(self.test_configs["BW_interval"])
@@ -480,19 +470,32 @@ class TestENA(TestCase):
             return
 
         direction = self.test_configs["BW_direction"]
-        ports_lists = []
+
+        target_gbps = int(self.test_configs["BW_target_gbps"])
+        if target_gbps == 0:
+            # Use instance default Gbps limit if not specified by the user
+            tester_gbps = self.tester.instance_max_gbps
+            dut_gbps = self.dut.instance_max_gbps
+        else:
+            dut_gbps = tester_gbps = target_gbps
 
         tester_conf = {
-            'instance'  : self.pktgen_tester,
+            'host'      : self.tester,
+            'pktgen'    : self.pktgen_tester,
             'tx_flow'   : self.test_configs["BW_tx_flow"],
             'f_pcap'    : PCAP_FILENAME_SUFFIX,
             'queue_nb'  : total_queues,     # verified by init_XXX_instance(s)
+            'max_gbps'  : tester_gbps,
+            'tx_rates'  : None
         }
         dut_conf = {
-            'instance'  : self.pktgen_dut,
+            'host'      : self.dut,
+            'pktgen'    : self.pktgen_dut,
             'tx_flow'   : False,
-            'f_pcap'    : None,             # pktgen cmd won't have '-s 0:...'
+            'f_pcap'    : PCAP_FILENAME_SUFFIX,
             'queue_nb'  : total_queues,     # verified by init_XXX_instance(s)
+            'max_gbps'  : dut_gbps,
+            'tx_rates'  : None
         }
 
         if direction == "mono":
@@ -500,17 +503,17 @@ class TestENA(TestCase):
             if self.test_configs["two_way_mono"] is False:
                 table_hdrs = ['direction','size', 'flows',
                         'Tx queues DUT / Tester', 'type',
-                        'Rx on DUT, Mb/s', 'Rx on DUT, pps'
+                        'Rx on DUT, Gb/s', 'Rx on DUT, Mpps'
                         ]
             else:
                 # This case is only used internally for debug purposes. Not
                 # relevant for a regular test suite execution
                 table_hdrs = ['direction','size', 'flows',
                         'Tx queues DUT / Tester', 'type',
-                        'Tx on Tester, Mb/s', 'Rx on Tester, Mb/s',
-                        'Tx on DUT, Mb/s', 'Rx on DUT, Mb/s',
-                        'Tx on Tester, pps', 'Rx on Tester, pps',
-                        'Tx on DUT, pps', 'Rx on DUT, pps',
+                        'Tx on Tester, Gb/s', 'Rx on Tester, Gb/s',
+                        'Tx on DUT, Gb/s', 'Rx on DUT, Gb/s',
+                        'Tx on Tester, Mpps', 'Rx on Tester, Mpps',
+                        'Tx on DUT, Mpps', 'Rx on DUT, Mpps',
                         ]
 
             tester_conf['mode'] = 'tx'
@@ -520,44 +523,80 @@ class TestENA(TestCase):
             self.logger.info('Direction: bi')
             table_hdrs = ['direction','size', 'flows',
                     'Tx queues DUT / Tester', 'type',
-                    'Rx on DUT, Mb/s',
-                    'Rx on Tester, Mb/s',
-                    'Rx on DUT, pps',
-                    'Rx on Tester, pps'
+                    'Rx on DUT, Gb/s',
+                    'Rx on Tester, Gb/s',
+                    'Rx on DUT, Mpps',
+                    'Rx on Tester, Mpps'
                     ]
 
             tester_conf['mode'] = 'bi'
             dut_conf['mode'] = 'bi'
 
-        if ports is None:
-            # Do not limit Tx rates for queues detection step
-            ports = self.generate_ports_list(dut_conf, tester_conf,
-                    total_queues, direction)
+        # Determine the flows for the Tester
+        tester_flows = flows
+        # If the flows weren't provided, try to load them from the existing file
+        if tester_flows is None and not self.test_configs['force_setup']:
+            tester_flows = self.load_flows_from_file(self.tester, self.dut)
+        # If still couldn't determine the flows, perform the detection step
+        if tester_flows is None:
+            tester_flows = self.generate_flows_list(tester_conf, dut_conf,
+                    total_queues, direction, self.max_flows_nb)
 
-        for flows_nb in flow_list:
-            flows_nb = int(flows_nb)
+        # Determine the flows for the DUT only for bidirectional tests or
+        # monodirectional-reverse
+        if direction == "bi" or self.test_configs["two_way_mono"]:
+            dut_flows = flows
+
+            if dut_flows is None and not self.test_configs['force_setup']:
+                dut_flows = self.load_flows_from_file(self.dut, self.tester)
+            if dut_flows is None:
+
+                dut_flows = self.generate_flows_list(dut_conf, tester_conf,
+                        total_queues, direction, self.max_flows_nb)
+        else:
+            # In any other case, just point dut and tester to the same flow array
+            # for compatibility with further code which requires both values to
+            # be valid lists.
+            dut_flows = tester_flows
+
+        # Now zip DUT and Tester flows into common structure
+        all_tester_flows_list = []
+        all_dut_flows_list = []
+        q_nb = min(dut_conf['queue_nb'], tester_conf['queue_nb'])
+        for flows_nb in flows_nb_list:
             if flows_nb < 1:
                 raise ValueError("Less than 1 flow makes no sense.")
-            if flows_nb <= dut_conf['queue_nb']:
-                ports_lists.append(ports[0:flows_nb])
-            else:
-                self.logger.info("Requested number of flows: %s is" \
-                        "larger than %s available queues" %
-                        (flows_nb, dut_conf['queue_nb']))
-                ports_lists.append(ports * (int(flows_nb) / len(ports)) \
-                        + ports[0:(int(flows_nb) % len(ports))])
+            flows_per_queue = flows_nb // q_nb
+            flows_remainder = flows_nb % q_nb
+            tester_flow_list = []
+            dut_flow_list = []
+            for (tester_ports_pairs, dut_ports_pairs, qid) in zip(tester_flows, dut_flows, range(q_nb)):
+                flows_needed = flows_per_queue
+                if qid < flows_remainder:
+                    flows_needed += 1
+                if flows_needed > 0:
+                    tester_flow_list.append(tester_ports_pairs[:flows_needed])
+                    dut_flow_list.append(dut_ports_pairs[:flows_needed])
+            all_tester_flows_list.append(tester_flow_list)
+            all_dut_flows_list.append(dut_flow_list)
+
+        self.logger.info("Requested DUT queues: {}, available: {}".format(
+            total_queues, dut_conf['queue_nb']))
 
         if direction == "mono":
             traffic = self.mono_traffic
-            tester_conf['tx_rates'] = self.test_configs['tx_rates']
+            tester_conf['tx_rates'] = AUTO_QUEUE_TX_RATE
             dut_conf['tx_rates'] = DEFAULT_QUEUE_TX_RATE
+            # When f_pcap has some value, then etgen tries to use pcap files on
+            # the host. As the Tester is the default Tx generator, this option
+            # should be initially disabled.
+            dut_conf['f_pcap'] = None
         elif direction == "bi":
             traffic = self.bi_traffic
-            # Compensate the parameters forbidden before generate_ports_list
+            # Compensate the parameters forbidden before generate_flows_list
             dut_conf['tx_flow'] = self.test_configs["BW_tx_flow"]
-            dut_conf['f_pcap'] = PCAP_FILENAME_SUFFIX
-            tester_conf['tx_rates'] = self.test_configs['tx_rates']
-            dut_conf['tx_rates'] = self.test_configs['tx_rates']
+            tester_conf['tx_rates'] = AUTO_QUEUE_TX_RATE
+            dut_conf['tx_rates'] = AUTO_QUEUE_TX_RATE
 
         # NOTE: These are deprecated for now
         # if stress is not None and direction == "tri":
@@ -568,11 +607,27 @@ class TestENA(TestCase):
         #     traffic = self.tester2_mono_traffic
 
         self.result_table_create(table_hdrs)
+        self.result_table_set_precision(3)
         self.pkt_cnts = []
+
+        addr_tester = {
+            "src_mac" : self.tester.get_mac_address(self.port_tester),
+            "dst_mac" : self.dut.get_mac_address(self.port_dut),
+            "src_ip"  : self.tester.get_ipv4_address(self.port_tester),
+            "dst_ip"  : self.dut.get_ipv4_address(self.port_dut),
+        }
+        addr_dut = {
+            "src_mac" : self.dut.get_mac_address(self.port_dut),
+            "dst_mac" : self.tester.get_mac_address(self.port_tester),
+            "src_ip"  : self.dut.get_ipv4_address(self.port_dut),
+            "dst_ip"  : self.tester.get_ipv4_address(self.port_tester),
+        }
 
         for pkt_sz in pkt_sizes:
             self.logger.info('\tSize:' + str(pkt_sz))
-            for _ports_list in ports_lists:
+            for (tester_flow_list, dut_flow_list) in zip(all_tester_flows_list, all_dut_flows_list):
+                self.logger.info('\t\tFlows number: {}'.format(
+                    sum([len(x) for x in tester_flow_list])))
                 for pkt_type in pkt_types:
                     # Reset changes of previous iterations
                     for cnf in [ tester_conf, dut_conf ]:
@@ -580,11 +635,13 @@ class TestENA(TestCase):
                         cnf['d_pcap'] = get_pcap_dirnm(pkt_sz, pkt_type, direction)
                     self.logger.info('\t\tPacket type:' + str(pkt_type))
                     self.logger.info('\t\t\tGenerating pcap file...')
-                    self.generate_pcap(_ports_list, pkt_type, pkt_sz, direction)
 
-                    self.logger.info('\t\t\tLaunching the traffic')
+                    self.generate_pcap(self.tester, addr_tester, tester_flow_list, pkt_type, pkt_sz, direction)
+                    if direction == "bi":
+                        self.generate_pcap(self.dut, addr_dut, dut_flow_list, pkt_type, pkt_sz, direction)
+
                     traffic(tester_conf, dut_conf, measurements_number,
-                            interval, pkt_sz, _ports_list, pkt_type)
+                            interval, pkt_sz, tester_flow_list, dut_flow_list, pkt_type)
 
                     if direction == "mono" and self.test_configs["two_way_mono"]:
                         _d_conf = dut_conf.copy()
@@ -593,13 +650,16 @@ class TestENA(TestCase):
                         _t_conf['mode'] = 'rx'
                         _d_conf['tx_flow'] = _t_conf['tx_flow']
                         _t_conf['tx_flow'] = False
+                        _t_conf['f_pcap'] = None
                         _d_conf['f_pcap'] = PCAP_FILENAME_SUFFIX
-                        _d_conf['tx_rates'] = self.test_configs['tx_rates']
+                        _d_conf['tx_rates'] = AUTO_QUEUE_TX_RATE
                         _t_conf['tx_rates'] = DEFAULT_QUEUE_TX_RATE
 
-                        self.mono_traffic_reverse(_t_conf, _d_conf,
+                        self.generate_pcap(self.dut, addr_dut, dut_flow_list, pkt_type, pkt_sz, direction)
+
+                        self.mono_traffic(_t_conf, _d_conf,
                                 measurements_number, interval, pkt_sz,
-                                _ports_list, pkt_type)
+                                tester_flow_list, dut_flow_list, pkt_type)
 
         self.pktgen_tester.end()
         self.pktgen_dut.end()
@@ -609,6 +669,7 @@ class TestENA(TestCase):
             self.result_table_create(['size', 'queues', 'type', 'DUT Tx', "DUT Rx",
                                       "Tester1 Tx", "Tester1 Rx", "Tester2 Tx",
                                       "Tester2 Rx"])
+            self.result_table_set_precision(3)
             for r in self.pkt_cnts:
                 self.result_table_add(r)
             self.result_table_print()
@@ -632,184 +693,265 @@ class TestENA(TestCase):
                         ]
 
             self.result_table_create(hdr_row)
+            self.result_table_set_precision(3)
 
             for r in self.pkt_cnts:
                 self.result_table_add(r)
             self.result_table_print()
 
-    def get_ports_filename(self):
-        t_port = self.tester.used_port
-        d_port = self.dut.used_port
-        out = 'ports_{tip}_{tmac}_{dip}_{dmac}'.format(
-                tip=self.tester.get_ipv4_address(t_port),
-                tmac=self.tester.get_mac_address(t_port),
-                dip=self.dut.get_ipv4_address(d_port),
-                dmac=self.dut.get_mac_address(d_port),
+    def get_flows_filename(self, tx_host, rx_host):
+        tx_port = tx_host.used_port
+        rx_port = rx_host.used_port
+        out = 'flows_{src_ip}_{src_mac}_{dst_ip}_{dst_mac}'.format(
+                src_ip=tx_host.get_ipv4_address(tx_port),
+                src_mac=tx_host.get_mac_address(tx_port),
+                dst_ip=rx_host.get_ipv4_address(rx_port),
+                dst_mac=rx_host.get_mac_address(rx_port),
                 )
         return out
 
-    def save_ports(self, ports):
-        fname = self.get_ports_filename()
-        self.tester.save_file(fname,json.dumps(ports))
-        self.logger.info("Ports list saved to {}".format(fname))
+    def save_flows(self, flows, tx_host, rx_host):
+        fname = self.get_flows_filename(tx_host, rx_host)
+        tx_host.send_expect("rm -f {}".format(fname), "# ")
+        tx_host.save_file(fname, json.dumps(flows))
+        tx_host.logger.info("Flows list saved to {}".format(fname))
 
-    def load_ports_from_file(self):
+    def load_flows_from_file(self, tx_host, rx_host):
         out = None
-        fname = self.get_ports_filename()
+        fname = self.get_flows_filename(tx_host, rx_host)
 
-        if self.tester.path_exist(fname) is True:
-            data = self.tester.send_expect("cat {}".format(fname), "# ")
+        if tx_host.path_exist(fname) is True:
+            data = tx_host.send_expect("cat {}".format(fname), "# ")
             try:
                 data = json.loads(data)
             except:
                 self.logger.error("Reading file {} failed." \
-                        "Ports list will be generated from scratch".format(fname))
+                        "Flows list will be generated from scratch".format(fname))
             else:
-                if type(data) is type([]) and len(data) == self.max_queue:
+                # Verify, if:
+                # 1. It's an list
+                # 2. It was created for the same amount of queues which are
+                #    planned to be used
+                # 3. There are enough flows for each queue
+                total_queues = self.validate("BW_queue", self.max_queue)
+                flows_per_q = [self.max_flows_nb // total_queues] * total_queues
+                for i in range(0, self.max_flows_nb % total_queues):
+                    flows_per_q[i] += 1
+                if type(data) is type([]) and \
+                   len(data) == total_queues and \
+                   all([len(d) >= f for (d, f) in zip(data, flows_per_q)]) :
                     out = data
 
         # Even if pcap files would be found, it is not sure whether they are
-        # valid ones if the ports list file was not found.
+        # valid ones.
         if out is None:
             self.test_configs['try_reuse_pcaps'] = False
 
         return out
 
-    def test_perf_bw(self, ports=None, stress=None):
-        if ports is None and self.test_configs['force_setup'] is False:
-                ports = self.load_ports_from_file()
+    def test_perf_bw(self, flows=None, stress=None):
+        if self.test_configs["BW_flows"] == "AUTO":
+            self.max_flows_nb = self.validate("BW_queue", self.max_queue)
+        else:
+            self.max_flows_nb = max([int(x) for x in self.test_configs["BW_flows"].split(",")])
 
-        self.__test_perf_bw(ports=ports)
+        self.__test_perf_bw(flows=flows)
 
-    def init_dut_instance(self, d_dict, queue_nb):
-        burst_rate = 100
+    @staticmethod
+    def init_pktgen_instance(conf, flow_list=None, burst_rate=100):
+        dev_port = conf['host'].used_port
+        pktgen = conf['pktgen']
+
+        return pktgen.init(dev_port, dev_port, conf, burst_rate, flow_list)
+
+    @staticmethod
+    def init_pktgen_instances(conf1, conf2, flow_list1, flow_list2):
         start_timeout = 2
 
-        d_inst = d_dict['instance']
-        d_dict['tx_rates'] = DEFAULT_QUEUE_TX_RATE
-        _q_num = d_inst.init(self.port_dut, self.port_dut, d_dict,
-                burst_rate)
-        d_dict['queue_nb'] = _q_num
+        conf1['queue_nb'] = TestENA.init_pktgen_instance(conf1, flow_list1)
+        conf2['queue_nb'] = TestENA.init_pktgen_instance(conf2, flow_list2)
 
         time.sleep(start_timeout)
 
-    def init_pktgen_instances(self, t_dict, d_dict, ports_list):
+    @staticmethod
+    def detect_best_rates(tx_conf, rx_conf, flow_list):
         burst_rate = 100
+        init_timeout = 3
         start_timeout = 2
-        flows = len(ports_list)
+        stop_timeout = 1
+        traffic_timeout = 5
+        # Max rate value is 10 Gbps per flow, absolute limit.
+        rate_max = 10000
+        txq_used = len(flow_list)
+        flows_nb = sum([len(queue_flow) for queue_flow in flow_list])
 
-        t_inst = t_dict['instance']
-        _q_num = t_inst.init(self.port_tester, self.port_tester, t_dict,
-                burst_rate, ports_list)
-        t_dict['queue_nb'] = _q_num
+        tx_host = tx_conf['host']
+        tx_host.logger.info("\tDetect the most optimal Tx rates for the flow")
 
-        d_inst = d_dict['instance']
-        _q_num = d_inst.init(self.port_dut, self.port_dut, d_dict,
-                burst_rate, ports_list)
-        d_dict['queue_nb'] = _q_num
+        tx_inst = tx_conf['pktgen']
+        rx_inst = rx_conf['pktgen']
+        f_pcap = rx_conf['f_pcap']
+        # Make sure that Rx machine don't use Tx pcaps
+        rx_conf['f_pcap'] = None
+        rxq_num = TestENA.init_pktgen_instance(rx_conf, flow_list)
+        rx_conf['f_pcap'] = f_pcap
 
+        # Each Tx queue can have different number of flows, so it's rate limit
+        # can differ
+        q_rate_max = [len(queue_flow) * rate_max for queue_flow in flow_list]
+        # Maximum possible rate for the single Tx flow, taking into
+        # consideration the number of queueus
+        flow_rate_max = min(rate_max, tx_conf["max_gbps"] * 1000 // flows_nb)
+        tx_rates = [int(len(queue_flow) * flow_rate_max) for queue_flow in flow_list]
+        # The step rate should be 1/10 of regular Tx queue rate, but not bigger than 1Gbps
+        step_rate = min(tx_rates[0] // 10, 1000)
+        old_tx_rates = list(tx_rates)
+
+        # Run once with default values and limit the flows to rate value, which
+        # was achieved
+        tx_conf["tx_rates"] = tx_rates
+        TestENA.init_pktgen_instance(tx_conf, flow_list)
+        time.sleep(init_timeout)
+
+        # Execute flow for 5 seconds
+        tx_inst.start()
         time.sleep(start_timeout)
+        # First statistic read juz zeroize the counters
+        rx_inst.queue_stats()
+        start_time = time.time()
+        time.sleep(traffic_timeout)
+        end_time = time.time()
+        (_, rxq_stats) = rx_inst.queue_stats()
+        tx_inst.quit()
+        time.sleep(stop_timeout)
 
-    def mono_traffic(self, t_conf, d_conf, msr_nb, interval, size, ports_list,
-            pkt_type):
-        t_gen = t_conf['instance']
-        d_gen = d_conf['instance']
-        flows = len(ports_list)
+        test_time = end_time - start_time
 
-        self.init_pktgen_instances(t_conf, d_conf, ports_list)
+        for qid in range(rxq_num):
+            rx_rate_total = rxq_stats[qid]["bytes"]
+            rx_rate_mbps = rx_rate_total * 8 // 1000000 // test_time
+            if rx_rate_mbps < (tx_rates[qid] - step_rate):
+                    # As rx_rate_mbps reading may not be not very accurate, adjust it by the step_rate value.
+                    # Especially small packets flows benefits from having higher rate.
+                    tx_rates[qid] = rx_rate_mbps + step_rate
 
-        stats_dict = self.generate_mono_traffic(t_gen, d_gen,
+        rate_stable = [False] * txq_used
+        rate_changed = True
+        # Increase rate for queues which show improvement until all queues have
+        # stable rate value.
+        while rate_changed:
+            old_tx_rates = tx_rates
+            tx_rates = [min(rate_max, rate + step_rate) if not stable else rate
+                        for (stable, rate, rate_max) in zip(rate_stable, old_tx_rates, q_rate_max)]
+            tx_conf["tx_rates"] = tx_rates
+
+            # Start Tx instance with new rates
+            TestENA.init_pktgen_instance(tx_conf, flow_list)
+            time.sleep(init_timeout)
+
+            # Execute flow for 5 seconds
+            tx_inst.start()
+            time.sleep(start_timeout)
+            # Clean Rx statistics
+            rx_inst.queue_stats()
+            start_time = time.time()
+            time.sleep(traffic_timeout)
+            end_time = time.time()
+            (_, rxq_stats) = rx_inst.queue_stats()
+            tx_inst.quit()
+            time.sleep(stop_timeout)
+            test_time = end_time - start_time
+
+            # Get the rate and compare it with expected
+            rate_changed = False
+            for qid in range(rxq_num):
+                if rate_stable[qid]:
+                    continue
+                rx_rate_total = rxq_stats[qid]["bytes"]
+                rx_rate_mbps = rx_rate_total * 8 // 1000000 // test_time
+                expected_rate = old_tx_rates[qid] + step_rate
+                if rx_rate_mbps >= expected_rate:
+                    # Keep the adjusted rate
+                    rate_changed = True
+                else:
+                    # Revert the old rate value
+                    tx_rates[qid] = old_tx_rates[qid]
+                    rate_stable[qid] = True
+
+        rx_inst.quit()
+        tx_host.logger.debug("\tDone. Tx rates detected: {}".format(tx_rates))
+
+    def mono_traffic(self, t_conf, d_conf, msr_nb, interval, size,
+            t_flow_list, d_flow_list, pkt_type):
+        if d_conf['mode'] == 'tx' and t_conf['mode'] == 'rx':
+            tx_conf = d_conf
+            rx_conf = t_conf
+            flow_dir_str = 'DUT -> Tester'
+            flow_list = d_flow_list
+        elif d_conf['mode'] == 'rx' and t_conf['mode'] == 'tx':
+            tx_conf = t_conf
+            rx_conf = d_conf
+            flow_dir_str = 'Tester -> DUT'
+            flow_list = t_flow_list
+        else:
+            assert 0, "Invalid mono traffic configuration - both Tx mode and Rx mode hosts must be provided."
+
+        tx_gen = tx_conf['pktgen']
+        rx_gen = rx_conf['pktgen']
+
+        TestENA.detect_best_rates(tx_conf, rx_conf, flow_list)
+
+        TestENA.init_pktgen_instances(tx_conf, rx_conf, flow_list, flow_list)
+
+        self.logger.info("\t\t\tLaunching the traffic")
+        stats_dict = self.generate_mono_traffic(tx_gen, rx_gen,
                 msr_nb, interval)
-        t_gen.quit()
-        d_gen.quit()
+        tx_gen.quit()
+        rx_gen.quit()
 
         parsed_stats = stats_dict['parsed_stats']
-        avg_tx_tester = stats_dict['avg_tx_stats']
-        avg_rx_dut = stats_dict['avg_rx_stats']
+        avg_tx = stats_dict['avg_tx_stats']
+        avg_rx = stats_dict['avg_rx_stats']
 
-        avg_rx_Mbps_dut = \
-            (8 * avg_rx_dut['rx_bytes'] / 1000000) / avg_rx_dut['rx_delay_sec']
-        avg_rx_pps_dut = avg_rx_dut['rx_pkt'] / avg_rx_dut['rx_delay_sec']
+        avg_rx_gbps = 8 * avg_rx['rx_bytes'] / 1000000000 / avg_rx['rx_delay_sec']
+        avg_rx_mpps = avg_rx['rx_pkt'] / 1000000 / avg_rx['rx_delay_sec']
 
-        avg_tx_Mbps_tester = \
-            (8 * avg_tx_tester['tx_bytes'] / 1000000) / avg_tx_tester['tx_delay_sec']
-        avg_tx_pps_tester = avg_tx_tester['tx_pkt'] / avg_tx_tester['tx_delay_sec']
+        avg_tx_gbps = 8 * avg_tx['tx_bytes'] / 1000000000 / avg_tx['tx_delay_sec']
+        avg_tx_mpps = avg_tx['tx_pkt'] / 1000000 / avg_tx['tx_delay_sec']
 
-        _q_str = "{} / {}".format(0, t_conf['queue_nb'])
-        pkts = ['Tester -> DUT', size, flows, _q_str, pkt_type] + parsed_stats[:]
+        _q_str = "{} / {}".format(0, tx_conf['queue_nb'])
+        flows_nb = sum([len(queue_flow) for queue_flow in flow_list])
+        pkts = [flow_dir_str, size, flows_nb, _q_str, pkt_type] + parsed_stats[:]
         self.pkt_cnts.append(pkts)
 
         if self.test_configs["two_way_mono"] is False:
-            self.result_table_add(['Tester -> DUT',size, flows,
+            self.result_table_add([flow_dir_str, size, flows_nb,
                 _q_str,
                 pkt_type,
-                avg_rx_Mbps_dut, avg_rx_pps_dut,
+                avg_rx_gbps, avg_rx_mpps,
                 ])
         else:
-            self.result_table_add(['Tester -> DUT', size, flows,
+            self.result_table_add([flow_dir_str, size, flows_nb,
                 _q_str,
                 pkt_type,
-                avg_tx_Mbps_tester, 0,
-                0, avg_rx_Mbps_dut,
-                avg_tx_pps_tester, 0,
-                0, avg_rx_pps_dut,
+                avg_tx_gbps, 0,
+                0, avg_rx_gbps,
+                avg_tx_mpps, 0,
+                0, avg_rx_mpps,
                 ])
 
-    # Only invoked if 'two_way_mono' is True. Configuration dictionaries are
-    # copies as the original ones are may still be needed after this function
-    # returns (in next iterations of the caller's loop)
-    def mono_traffic_reverse(self, t_conf, d_conf, msr_nb, interval, size,
-            ports_list, pkt_type):
+    def bi_traffic(self, t_conf, d_conf, msr_nb, interval, size,
+            t_flow_list, d_flow_list, pkt_type):
+        t_gen = t_conf['pktgen']
+        d_gen = d_conf['pktgen']
+        # The number of flows should be symmetrical
+        flows_nb = sum([len(queue_flow) for queue_flow in t_flow_list])
 
-        t_gen = t_conf['instance']
-        d_gen = d_conf['instance']
-	flows = len(ports_list)
+        TestENA.detect_best_rates(t_conf, d_conf, t_flow_list)
+        TestENA.detect_best_rates(d_conf, t_conf, d_flow_list)
+        TestENA.init_pktgen_instances(t_conf, d_conf, t_flow_list, d_flow_list)
 
-        self.init_pktgen_instances(t_conf, d_conf, ports_list)
-
-        # The traffic direction in backward: DUT -> Tester
-        stats_dict = self.generate_mono_traffic(d_gen, t_gen, msr_nb, interval,
-                is_backward=True)
-
-        parsed_stats = stats_dict['parsed_stats']
-        avg_tx_dut = stats_dict['avg_tx_stats']
-        avg_rx_tester = stats_dict['avg_rx_stats']
-
-        avg_rx_Mbps_tester = \
-            (8 * avg_rx_tester['rx_bytes'] / 1000000) / avg_rx_tester['rx_delay_sec']
-        avg_rx_pps_tester = avg_rx_tester['rx_pkt'] / avg_rx_tester['rx_delay_sec']
-
-        avg_tx_Mbps_dut = \
-            (8 * avg_tx_dut['tx_bytes'] / 1000000) / avg_tx_dut['tx_delay_sec']
-        avg_tx_pps_dut = avg_tx_dut['tx_pkt'] / avg_tx_dut['tx_delay_sec']
-
-        t_gen.quit()
-        d_gen.quit()
-
-        # Only printed if 'two_way_mono' is True
-        _q_str = "{} / {}".format(d_conf['queue_nb'], 0)
-        self.result_table_add(['DUT -> Tester',size, flows,
-            _q_str,
-            pkt_type,
-            0, avg_rx_Mbps_tester,
-            avg_tx_Mbps_dut, 0,
-            0, avg_rx_pps_tester,
-            avg_tx_pps_dut, 0,
-            ])
-
-        _q_str = "{} / {}".format(d_conf['queue_nb'], 0)
-        pkts = ['DUT -> Tester', size, flows, _q_str, pkt_type] + parsed_stats[:]
-        self.pkt_cnts.append(pkts)
-
-    def bi_traffic(self, t_conf, d_conf, msr_nb, interval, size, ports_list,
-            pkt_type):
-
-        t_gen = t_conf['instance']
-        d_gen = d_conf['instance']
-        flows = len(ports_list)
-
-        self.init_pktgen_instances(t_conf, d_conf, ports_list)
-
+        self.logger.info("\t\t\tLaunching the traffic")
         stats_dict = self.generate_bi_traffic(t_gen, d_gen, msr_nb, interval)
         t_gen.quit()
         d_gen.quit()
@@ -818,31 +960,27 @@ class TestENA(TestCase):
         avg_t_pc = stats_dict['avg_tester_stats']
         avg_d_pc = stats_dict['avg_dut_stats']
 
-        avg_d_tx_Mbps = \
-            (8 * avg_d_pc['tx_bytes'] / 1000000) / avg_d_pc['tx_delay_sec']
-        avg_d_tx_pps = avg_d_pc['tx_pkt'] / avg_d_pc['tx_delay_sec']
+        avg_d_tx_gbps = 8 * avg_d_pc['tx_bytes'] / 1000000000 / avg_d_pc['tx_delay_sec']
+        avg_d_tx_mpps = avg_d_pc['tx_pkt'] / 1000000 / avg_d_pc['tx_delay_sec']
 
-        avg_t_rx_Mbps = \
-            (8 * avg_t_pc['rx_bytes'] / 1000000) / avg_t_pc['rx_delay_sec']
-        avg_t_rx_pps = avg_t_pc['rx_pkt'] / avg_t_pc['rx_delay_sec']
+        avg_t_rx_gbps = 8 * avg_t_pc['rx_bytes'] / 1000000000 / avg_t_pc['rx_delay_sec']
+        avg_t_rx_mpps = avg_t_pc['rx_pkt'] / 1000000 / avg_t_pc['rx_delay_sec']
 
-        avg_d_rx_Mbps = \
-            (8 * avg_d_pc['rx_bytes'] / 1000000) / avg_d_pc['rx_delay_sec']
-        avg_d_rx_pps = avg_d_pc['rx_pkt'] / avg_d_pc['rx_delay_sec']
+        avg_d_rx_gbps = 8 * avg_d_pc['rx_bytes'] / 1000000000 / avg_d_pc['rx_delay_sec']
+        avg_d_rx_mpps = avg_d_pc['rx_pkt'] / 1000000 / avg_d_pc['rx_delay_sec']
 
-        avg_t_tx_Mbps = \
-            (8 * avg_t_pc['tx_bytes'] / 1000000) / avg_t_pc['tx_delay_sec']
-        avg_t_tx_pps = avg_t_pc['tx_pkt'] / avg_t_pc['tx_delay_sec']
+        avg_t_tx_gbps = 8 * avg_t_pc['tx_bytes'] / 1000000000 / avg_t_pc['tx_delay_sec']
+        avg_t_tx_mpps = avg_t_pc['tx_pkt'] / 1000000 / avg_t_pc['tx_delay_sec']
 
         _q_str = "{} / {}".format(d_conf['queue_nb'], t_conf['queue_nb'])
-        self.result_table_add(['Tester <=> DUT', size, flows, _q_str, pkt_type,
-            avg_d_rx_Mbps,
-            avg_t_rx_Mbps,
-            avg_d_rx_pps,
-            avg_t_rx_pps
+        self.result_table_add(['Tester <=> DUT', size, flows_nb, _q_str, pkt_type,
+            avg_d_rx_gbps,
+            avg_t_rx_gbps,
+            avg_d_rx_mpps,
+            avg_t_rx_mpps
             ])
 
-        pkts = ['Tester <=> DUT', size, flows, _q_str, pkt_type] + parsed_stats
+        pkts = ['Tester <=> DUT', size, flows_nb, _q_str, pkt_type] + parsed_stats
         self.pkt_cnts.append(pkts)
 
     # The `backward` parameter affects only results placement order:
@@ -858,16 +996,16 @@ class TestENA(TestCase):
             pkts = [add_unit(p[0] / p[1]) for p in [
                     (8 * tx_pc["tx_bytes"], tx_pc["tx_delay_sec"]),
                     (8 * rx_pc["rx_bytes"], rx_pc["rx_delay_sec"]),
-                    (missing, 1.0),
-                    (tx_pc["tx_err"], 1.0),
-                    (rx_pc["rx_err"], 1.0),
-                    (rx_pc["rx_drops"], 1.0),
+                    (missing, 1),
+                    (tx_pc["tx_err"], 1),
+                    (rx_pc["rx_err"], 1),
+                    (rx_pc["rx_drops"], 1),
                     (8 * rx_pc["tx_bytes"], rx_pc["tx_delay_sec"]),
                     (8 * tx_pc["rx_bytes"], tx_pc["rx_delay_sec"]),
-                    (missing_bw, 1.0),
-                    (rx_pc["tx_err"], 1.0),
-                    (tx_pc["rx_err"], 1.0),
-                    (tx_pc["rx_drops"], 1.0)
+                    (missing_bw, 1),
+                    (rx_pc["tx_err"], 1),
+                    (tx_pc["rx_err"], 1),
+                    (tx_pc["rx_drops"], 1)
                 ]]
 
         elif self.test_configs["BW_direction"] == "mono":
@@ -876,19 +1014,19 @@ class TestENA(TestCase):
                 pkts = [add_unit(p[0] / p[1]) for p in [
                         (8 * tx_pc["tx_bytes"], tx_pc["tx_delay_sec"]),
                         (8 * rx_pc["rx_bytes"], rx_pc["rx_delay_sec"]),
-                        (missing, 1.0),
-                        (tx_pc["tx_err"], 1.0),
-                        (rx_pc["rx_err"], 1.0),
-                        (rx_pc["rx_drops"], 1.0),
+                        (missing, 1),
+                        (tx_pc["tx_err"], 1),
+                        (rx_pc["rx_err"], 1),
+                        (rx_pc["rx_drops"], 1),
                         ]]
                 # pkts.extend([0,0,0,0,0,0])
                 pkts.extend([add_unit(p[0] / p[1]) for p in [
                     (8 * rx_pc["tx_bytes"], rx_pc["rx_delay_sec"]),
                     (8 * tx_pc["rx_bytes"], tx_pc["tx_delay_sec"]),
-                    (missing_bw, 1.0),
-                    (rx_pc["tx_err"], 1.0),
-                    (tx_pc["rx_err"], 1.0),
-                    (tx_pc["rx_drops"], 1.0)
+                    (missing_bw, 1),
+                    (rx_pc["tx_err"], 1),
+                    (tx_pc["rx_err"], 1),
+                    (tx_pc["rx_drops"], 1)
                     ]])
             else:
                 missing_bw = rx_pc["tx_pkt"] - tx_pc["rx_pkt"]
@@ -896,18 +1034,18 @@ class TestENA(TestCase):
                 pkts = [add_unit(p[0] / p[1]) for p in [
                     (8 * rx_pc["tx_bytes"], rx_pc["rx_delay_sec"]),
                     (8 * tx_pc["rx_bytes"], tx_pc["tx_delay_sec"]),
-                    (missing_bw, 1.0),
-                    (rx_pc["tx_err"], 1.0),
-                    (tx_pc["rx_err"], 1.0),
-                    (tx_pc["rx_drops"], 1.0)
+                    (missing_bw, 1),
+                    (rx_pc["tx_err"], 1),
+                    (tx_pc["rx_err"], 1),
+                    (tx_pc["rx_drops"], 1)
                         ]]
                 pkts.extend([add_unit(p[0] / p[1]) for p in [
                         (8 * tx_pc["tx_bytes"], tx_pc["tx_delay_sec"]),
                         (8 * rx_pc["rx_bytes"], rx_pc["rx_delay_sec"]),
-                        (missing, 1.0),
-                        (tx_pc["tx_err"], 1.0),
-                        (rx_pc["rx_err"], 1.0),
-                        (rx_pc["rx_drops"], 1.0),
+                        (missing, 1),
+                        (tx_pc["tx_err"], 1),
+                        (rx_pc["rx_err"], 1),
+                        (rx_pc["rx_drops"], 1),
                         ]])
 
         return pkts
@@ -915,102 +1053,56 @@ class TestENA(TestCase):
     def generate_pcap_execute(self, host, pkg, l=8192):
         host.scapy_foreground()
         burst = len(pkg)
-        m = l / burst
+        m = l // burst
         m += 1 if l % burst != 0 else 0
         host.scapy_append('wrpcap("{}", ([{}]*{})[:{}])'.format(
             PCAP_FILENAME_SUFFIX, ", ".join(pkg), m, l))
         status = host.scapy_execute()
         self.verify(status == 0, "Error during generating pcap files.")
 
-    # Creates pcap files both on Tester and DUT, although detection of queues
-    # were performed only on DUT. We rely on the fact that this is
-    # Rx_port-to-queue association is the same on all instances using DPDK.
-    def generate_pcap(self, ports, pkt_type, size, direction="mono"):
+    # Creates pcap files both on given host.
+    def generate_pcap(self, host, addr, flows, pkt_type, size, direction="mono"):
+        if not self.test_configs["BW_tx_flow"]:
+            return
+
         pcap_dir = get_pcap_dirnm(size, pkt_type, direction)
 
-        t_ex_pcaps = []
-        d_ex_pcaps = []
-
+        ex_pcaps = []
         # Additionally to start parameters, the 'try_reuse_pcaps' entry can be
-        # set to `False` by the `load_ports_from_file`.
+        # set to `False` by the `load_flows_from_file`.
         if self.test_configs['force_setup'] is False and \
             self.test_configs['try_reuse_pcaps'] is True:
             self.logger.debug("Trying to reuse pcaps")
-            if self.tester.path_exist(pcap_dir):
-                find_existing_pcaps(self.tester, t_ex_pcaps, pcap_dir)
-            if self.dut.path_exist(pcap_dir):
-                find_existing_pcaps(self.dut, d_ex_pcaps, pcap_dir)
+            if host.path_exist(pcap_dir):
+                find_existing_pcaps(host, ex_pcaps, pcap_dir)
         else:
             self.logger.debug("Pcaps cannot be reused")
 
-        self.logger.debug("Pcaps on Tester: {}".format(t_ex_pcaps))
-        self.logger.debug("Pcaps on Dut: {}".format(d_ex_pcaps))
-        pkg_rx = []     # tests DUT's Rx performance
-        for port in ports:
-            if port in d_ex_pcaps:
-                continue
-            self.logger.debug("Rx, needs creation: %s " % port)
-            pkg = generate_pcap_string(port, pkt_type, size)
-            pkg_rx.append(pkg.format(
-                smac=self.smac, dmac=self.dmac,
-                sip=self.sip, dip=self.dip))
+        self.logger.debug("Pcaps found: {}".format(ex_pcaps))
+        self.pcap_per_queue(host, addr, flows, pkt_type, size, pcap_dir, ex_pcaps)
 
-        pkg_tx = []     # Tx, respectively
-        for port in ports:
-            if port in t_ex_pcaps:
-                continue
-            self.logger.debug("Tx, needs creation: %s " % port)
-            pkg = generate_pcap_string(port, pkt_type, size)
-            pkg_tx.append(pkg.format(
-                smac=self.dmac, dmac=self.smac,
-                sip=self.dip, dip=self.sip))
-
-        if self.test_configs["BW_tx_flow"]:
-            self.pcap_per_queue(ports, pkt_type, size, pcap_dir, t_ex_pcaps,
-                    d_ex_pcaps)
-
-    def pcap_per_queue(self, ports, pkt_type, size, pcap_dir, t_ports,
-            d_ports):
-        # Create directories on both ends if not existing
-        self.tester.mk_dir(pcap_dir)
-        self.dut.mk_dir(pcap_dir)
+    def pcap_per_queue(self, host, addr, flows, pkt_type, size, pcap_dir, ex_flows):
+        # Create directory if it does not exist
+        host.mk_dir(pcap_dir)
 
         # pcap files are indexed from 0
-        t_start = len(t_ports)
-        self.logger.debug("t_start: %s" % t_start)
-        d_start = len(d_ports)
-        self.logger.debug("d_start: %s" % d_start)
+        start = len(ex_flows)
+        self.logger.debug("start: {}".format(start))
 
-        # DUT part
-        i = d_start
-        for port in ports:
-            if port in d_ports:
+        i = start
+        for ports_pairs in flows:
+            if ports_pairs in ex_flows:
                 continue
-            pkg = generate_pcap_string(port, pkt_type, size)
-            tx = pkg.format(smac=self.dmac, dmac=self.smac,
-                            sip=self.dip, dip=self.sip)
-            _p_fpath = gen_pcap_fpath(port, i, pcap_dir)
+            pkg = generate_pcap_string(ports_pairs, pkt_type, size)
+            pcap_cmd = pkg.format(smac=addr["src_mac"], dmac=addr["dst_mac"],
+                                  sip=addr["src_ip"], dip=addr["dst_ip"])
+            _p_fpath = gen_pcap_fpath(ports_pairs, i, pcap_dir)
             self.logger.debug("Generating: %s" % _p_fpath)
-            self.dut.scapy_append("wrpcap('{}', [{}]*2048)".format(
-                    _p_fpath, tx))
+            flow_entries = 2048 // len(ports_pairs)
+            host.scapy_append("wrpcap('{}', [{}]*{})".format(_p_fpath, pcap_cmd, flow_entries))
             i += 1
 
-        # Tester part
-        i = t_start
-        for port in ports:
-            if port in t_ports:
-                continue
-            pkg = generate_pcap_string(port, pkt_type, size)
-            rx = pkg.format(smac=self.smac, dmac=self.dmac,
-                            sip=self.sip, dip=self.dip)
-            _p_fpath = gen_pcap_fpath(port, i, pcap_dir)
-            self.logger.debug("Generating: %s" % _p_fpath)
-            self.tester.scapy_append("wrpcap('{}', [{}]*2048)".format(
-                    _p_fpath, rx))
-            i += 1
-
-        for host in [self.tester, self.dut]:
-            host.scapy_execute()
+        host.scapy_execute()
 
     def generate_mono_traffic(self, tx, rx, msr_nb, interval, is_backward=False):
         start_timeout = 2
@@ -1193,17 +1285,17 @@ print(ports)
         # Local pcap is copied to tester, then more information is retrieved
         # from the remote copy in order not to require Scapy to be installed
         # locally.
-        ports = self.get_queues_from_pcap(tester_path)
+        flows = self.get_queues_from_pcap(tester_path)
 
         # Assumption - Differently to `test_perf_bw`:
-        # - `flows` NOT set by the "BW_flows" parameter, determined by the
+        # - `flows_nb` NOT set by the "BW_flows" parameter, determined by the
         #   number of different pairs of ports in packets inside the pcap file,
         # - `total_queues` NOT set by "BW_queue" parameter, primarily equals to
         # `flows` but additionally limited by `self.max_queue`,
-        flows = len(ports)
+        flows_nb = len(flows)
 
         total_queues = \
-            flows if flows <= self.max_queue else self.max_queue
+            flows_nb if flows_nb <= self.max_queue else self.max_queue
         if total_queues < self.MIN_QUEUE:
             self.verify(0, "Wrong number of queues")
 
@@ -1219,14 +1311,16 @@ print(ports)
         assert measurements_number >= 1, "Unsupported number of measurements."
 
         tester_conf = {
-            'instance'  : self.pktgen_tester,
+            'host'      : self.tester,
+            'pktgen'    : self.pktgen_tester,
             'tx_flow'   : self.test_configs["BW_tx_flow"],
             'f_pcap'    : pcap_tester,
             'queue_nb'  : total_queues,    # filled by init_pktgen_instances
             'pcap_cmd'  : cmd_pcap_path,
         }
         dut_conf = {
-            'instance'  : self.pktgen_dut,
+            'host'      : self.dut,
+            'pktgen'    : self.pktgen_dut,
             'tx_flow'   : False,
             'f_pcap'    : None,
             'queue_nb'  : total_queues,    # filled by init_pktgen_instances
@@ -1237,8 +1331,8 @@ print(ports)
         direction = 'mono'
 
         # Nb of flows may surpass self.max_queue but it is always equal to
-        # len(ports)
-        self.init_pktgen_instances(tester_conf, dut_conf, ports)
+        # len(flows)
+        TestENA.init_pktgen_instances(tester_conf, dut_conf, flows, flows)
 
         stats_dict = self.generate_mono_traffic(self.pktgen_tester,
                 self.pktgen_dut, measurements_number, interval)
@@ -1251,11 +1345,12 @@ print(ports)
         self.pktgen_dut.quit()
 
         self.result_table_create(['direction','size', 'flows',
-            'Tx queues DUT / Tester', 'type', 'Rx on DUT, Mb/s',
+            'Tx queues DUT / Tester', 'type', 'Rx on DUT, Gb/s',
             'Rx on DUT, pps' ])
+        self.result_table_set_precision(3)
 
         # Packet type and size not known - depends on the pcap contents
-        self.result_table_add(['Tester -> DUT', 'N/A', flows,
+        self.result_table_add(['Tester -> DUT', 'N/A', flows_nb,
             total_queues, 'N/A', rx_bps_dut, rx_pps_dut])
         self.result_table_print()
 
@@ -1295,27 +1390,32 @@ def add_unit(value):
     for unit in ["", "k", "M", "G", "T", "P", "E", "Z"]:
         if abs(value) < 1000:
             return "{:.3f} {}".format(value, unit)
-        value /= 1000.0
+        value /= 1000
 
 def find_existing_pcaps(crb_obj, ex_pcaps, p_dir):
-    patt = re.compile(r'\d{1,}_([\d]{1,})_([\d]{1,})_*')
+    patt = re.compile(r'_(\d+)_(\d+)')
     _flist = crb_obj.send_expect("ls -1 {}".format(p_dir), "# ")
     for l in _flist.split('\n'):
-        res = patt.search(l)
+        res = patt.findall(l)
         if res is not None:
-            o = res.groups()
-            ex_pcaps.append([int(o[0]), int(o[1])])
+            ports = []
+            for r in res:
+                ports.append([int(r[0]), int(r[1])])
+            ex_pcaps.append(ports)
 
 
-def generate_pcap_string(port, pkt_type, size):
+def generate_pcap_string(ports_pairs, pkt_type, size):
     header_size = HEADER_SIZE['eth'] + HEADER_SIZE['ip'] + HEADER_SIZE[pkt_type]
     padding = size - header_size
-    pkg = 'Ether(src="{{smac}}", dst="{{dmac}}")/' \
-          'IP(src="{{sip}}", dst="{{dip}}")/' \
-          '{pkt_type}(sport={sport}, dport={dport})/' \
-          'Raw(load="P" * {padding})'\
-        .format(pkt_type=pkt_type.upper(), sport=port[0],
-                dport=port[1], padding=padding)
+    flags = ", flags=0" if pkt_type == "tcp" else ""
+    pkg = ""
+    for pp in ports_pairs:
+        pkg += 'Ether(src="{{smac}}", dst="{{dmac}}")/' \
+               'IP(src="{{sip}}", dst="{{dip}}")/' \
+               '{pkt_type}(sport={sport}, dport={dport}{flags})/' \
+               'Raw(load="P" * {padding}),'\
+                    .format(pkt_type=pkt_type.upper(), sport=pp[0],
+                        dport=pp[1], flags=flags, padding=padding)
     return pkg
 
 def get_pcap_dirnm(size, pkt_type, direction):

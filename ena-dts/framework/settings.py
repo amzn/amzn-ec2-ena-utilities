@@ -160,6 +160,9 @@ PCAP_DUT = "pcap_dut.pcap"
 
 PCAP_FILENAME_SUFFIX = 'ena_test.pcap'
 
+# Tx rate value set to auto will force DTS to automatically
+# find the best rates.
+AUTO_QUEUE_TX_RATE = '0'
 DEFAULT_QUEUE_TX_RATE = '3500'
 
 def get_nic_name(type):

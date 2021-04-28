@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python2
 # BSD LICENSE
 #
 # Copyright(c) 2010-2014 Intel Corporation. All rights reserved.
@@ -51,12 +51,12 @@
      - --BW-no-tx-flow
      - --BW-port-min
      - --BW-port-max
+     - --BW-target-gbps
      - --stress-cpu-inst
      - --stress-vm-inst
      - --stress-vm-size
      - --skip-target-env-setup
      - --try-reuse-pcaps
-     - --tx-rates
    * Add default test cases
    * Pass test configuration to the dts
 """
@@ -68,7 +68,6 @@ A test framework for testing DPDK.
 import os
 import sys
 import argparse
-from settings import DEFAULT_QUEUE_TX_RATE
 
 # change operation directory
 os.chdir("../")
@@ -177,11 +176,11 @@ parser.add_argument('--BW-queue',
                          'min(cpu-2, BW-queue) queues will be started.')
 
 parser.add_argument('--BW-interval',
-                    default="10",
+                    default="5",
                     help='Interval between measurements in seconds.')
 
 parser.add_argument('--BW-measurements',
-                    default="1",
+                    default="6",
                     help='Number of measurements.')
 
 parser.add_argument('--BW-direction',
@@ -203,6 +202,13 @@ parser.add_argument('--BW-port-min',
 parser.add_argument('--BW-port-max',
                     default="9000",
                     help='Maximum TCP/UDP port used for creating a flow.')
+
+parser.add_argument('--BW-target-gbps',
+                    default="0",
+                    help='Gbps limit for the instance. The closest it\'s to a'
+                    'real value, the better performance and stability could be'
+                    'achieved. 0 value means autodetection, depending on'
+                    'instance type.')
 
 parser.add_argument('--stress-cpu-inst',
                     default="AUTO",
@@ -230,13 +236,6 @@ parser.add_argument('--try-reuse-pcaps',
                     'match exactly requested configuration: direction, number'
                     'of flows, traffic type and size of packets.')
 
-parser.add_argument('--tx-rates',
-                    default=DEFAULT_QUEUE_TX_RATE,
-                    help='Specify per-lcore Tx rates (in Mbps) in a format as'
-                    'in example: 3500.1-4:2000;8:5000;12,16:4000. The value'
-                    'before dot is the default Tx rate. Then, specific values'
-                    'can be set individually or in ranges')
-
 args = parser.parse_args()
 
 
@@ -251,13 +250,13 @@ test_configs = {"BW_size": args.BW_sizes,
                 "BW_tx_flow": not args.BW_no_tx_flow,
                 "BW_port_min": args.BW_port_min,
                 "BW_port_max": args.BW_port_max,
+                "BW_target_gbps": args.BW_target_gbps,
                 "stress_cpu_inst": args.stress_cpu_inst,
                 "stress_vm_inst": args.stress_vm_inst,
                 "stress_vm_size": args.stress_vm_size,
                 "skip_target_env_setup": args.skip_target_env_setup,
                 "try_reuse_pcaps": args.try_reuse_pcaps and \
                         "test_perf_bw" in args.test_cases,
-                "tx_rates": args.tx_rates
                 }
 
 # Main program begins here

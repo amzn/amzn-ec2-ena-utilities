@@ -46,6 +46,7 @@
      cleanup
    * Remove method for the DPDKtester:
      - setup_memory
+     - remove all versions of setup_modules and restore_modules
    * Add method for the DPDKtester:
      - set_target
    * Add functions:
@@ -59,6 +60,8 @@
      - install_epel
      - install_libpcap
      - install_lua
+     - install_patched_vfio
+     - build_igb_uio
 """
 
 import os
@@ -111,9 +114,7 @@ class DPDKdut(Dut):
         # These have to be setup all the time. Some tests need to compile
         # example apps by themselves and will fail otherwise.
         self.send_expect("export RTE_TARGET=" + target, "#")
-        self.send_expect("export RTE_SDK=`pwd`", "#")
         # May be required by the meson build system for the pktgen
-        self.send_expect("export PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig", "#")
 
         self.set_rxtx_mode()
 
@@ -121,95 +122,10 @@ class DPDKdut(Dut):
             self.build_install_dpdk(target)
             install_apps(self)
             self.setup_memory()
-            self.setup_modules(target)
+            self.setup_modules()
             self.extra_nic_setup()
         else:
             self.logger.info('SKIPPED target environment setup')
-
-
-    def setup_modules(self, target):
-        """
-        Install DPDK required kernel module on DUT.
-        """
-        setup_modules = getattr(self, 'setup_modules_%s' % self.get_os_type())
-        setup_modules(target)
-
-    def setup_modules_linux(self, target):
-        drivername = load_global_setting(HOST_DRIVER_SETTING)
-        drivermode = load_global_setting(HOST_DRIVER_MODE_SETTING)
-        if drivername == "vfio-pci":
-            self.send_expect("rmmod vfio_pci", "#", 70)
-            self.send_expect("rmmod vfio_iommu_type1", "#", 70)
-            self.send_expect("rmmod vfio", "#", 70)
-            self.send_expect("modprobe vfio", "#", 70)
-            self.send_expect("modprobe vfio-pci", "#", 70)
-            out = self.send_expect("lsmod", "#")
-            assert ("vfio_pci" in out), "Failed to setup vfio-pci"
-
-            if drivermode == "noiommu":
-                self.send_expect("echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode", "#", 70)
-
-        elif drivername == "uio_pci_generic":
-            self.send_expect("modprobe uio", "#", 70)
-            self.send_expect("modprobe uio_pci_generic", "#", 70)
-            out = self.send_expect("lsmod | grep uio_pci_generic", "#")
-            assert ("uio_pci_generic" in out), "Failed to setup uio_pci_generic"
-
-        else:
-            self.send_expect("modprobe uio", "#", 70)
-            out = self.send_expect("lsmod | grep igb_uio", "#")
-            if "igb_uio" in out:
-                self.send_expect("rmmod -f igb_uio", "#", 70)
-            wc = "wc_activate=1" if drivermode == "wc" else ""
-            subpath = "kmod" if self.build_system is MAKE_BUILD else "kernel/linux/igb_uio"
-            self.send_expect("insmod ./{}/{}/igb_uio.ko {}".format(
-                target, subpath, wc), "#", 60)
-
-            out = self.send_expect("lsmod | grep igb_uio", "#")
-            assert ("igb_uio" in out), "Failed to insmod igb_uio"
-
-    def setup_modules_freebsd(self, target):
-        """
-        Install DPDK required Freebsd kernel module on DUT.
-        """
-        binding_list = ''
-
-        for (pci_bus, pci_id) in self.pci_devices_info:
-            if accepted_nic(pci_id):
-                binding_list += '%s,' % (pci_bus)
-
-        self.send_expect("kldunload if_ixgbe.ko", "#")
-        self.send_expect('kenv hw.nic_uio.bdfs="%s"' % binding_list[:-1], '# ')
-        self.send_expect("kldload ./%s/kmod/nic_uio.ko" % target, "#", 20)
-        out = self.send_expect("kldstat", "#")
-        assert ("nic_uio" in out), "Failed to insmod nic_uio"
-
-    def restore_modules(self, skip=False):
-        """
-        Restore DPDK kernel module on DUT.
-        """
-        if skip:
-            self.logger.info('SKIPPED restoring modules')
-            return
-
-        restore_modules = getattr(self, 'restore_modules_%s' % self.get_os_type())
-        restore_modules()
-
-    def restore_modules_linux(self):
-        """
-        Restore DPDK Linux kernel module on DUT.
-        """
-        drivername = load_global_setting(HOST_DRIVER_SETTING)
-        if drivername == "vfio-pci":
-            drivermode = load_global_setting(HOST_DRIVER_MODE_SETTING)
-            if drivermode == "noiommu":
-                self.send_expect("echo 0 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode", "#", 70)
-
-    def restore_modules_freebsd(self):
-        """
-        Restore DPDK Freebsd kernel module on DUT.
-        """
-        pass
 
     def set_rxtx_mode(self):
         """
@@ -247,9 +163,6 @@ class DPDKdut(Dut):
         """
         Build DPDK source code with specified target.
         """
-        # Always build IGB_UIO - from v20.02 it is disabled by default
-        # (and on arm, too)
-        extra_options += ' CONFIG_RTE_EAL_IGB_UIO=y'
         build_install_dpdk = getattr(self, 'build_install_dpdk_%s' % self.get_os_type())
         build_install_dpdk(target, extra_options)
 
@@ -295,7 +208,7 @@ class DPDKdut(Dut):
             check_build(out)
         elif self.build_system is MESON_BUILD:
             # configure
-            out = self.send_expect("meson %s -Denable_kmods=true" % (target),
+            out = self.send_expect("meson {} -Dprefix={}".format(target, self.install_dir),
                                    "# ", build_time)
             check_build(out)
             out = self.send_expect("ninja -C %s" %(target), "# ", build_time)
@@ -304,19 +217,19 @@ class DPDKdut(Dut):
             check_build(out)
         else:
             assert False, "Invalid build system detected"
-        self.send_expect("ldconfig", "# ",)
 
         # Build pktgen
         if self.pktgen is not None:
+            include_var = "C_INCLUDE_PATH={}/include".format(self.install_dir)
             self.send_expect("cd {}".format(self.pktgen_dir), "# ")
             if self.build_system is MAKE_BUILD:
-                out = self.send_expect("{}make".format(debug_make),
+                out = self.send_expect("{} {} make".format(debug_make, include_var),
                                        "# ", build_time)
             else:
                 out = self.send_expect("meson build -Denable_lua=true",
                                        "#", build_time)
                 check_build(out)
-                out = self.send_expect("ninja -C build", "#", build_time)
+                out = self.send_expect("{} ninja -C build".format(include_var), "#", build_time)
             self.send_expect("cd ..", "# ")
             check_build(out)
 
@@ -361,12 +274,14 @@ class DPDKdut(Dut):
         cmd_build_test = "make -j %d -C test/" % (self.number_of_cores)
         if os_type == "freebsd":
             cmd_build_test = "make -j %d -C test/ CC=gcc48" % (self.number_of_cores)
-       
+
     def prepare_package(self, test_configs):
         if not self.skip_setup:
             copy_files(self)
         if not test_configs["skip_target_env_setup"]:
             install_packages(self)
+            install_patched_vfio(self)
+            build_igb_uio(self)
         else:
             self.logger.info('DUT: SKIPPED packages installation')
 
@@ -374,6 +289,7 @@ class DPDKdut(Dut):
         """
         Copy DPDK package to DUT and apply patch files.
         """
+        self.set_env()
         self.prepare_package(test_configs)
         self.dut_prerequisites()
         self.stage = "post-init"
@@ -493,10 +409,14 @@ class DPDKtester(Tester):
         """
         self.kill_all()
 
+        self.set_env()
+
         if not self.skip_setup:
             copy_files(self)
         if not test_configs["skip_target_env_setup"]:
             install_packages(self)
+            install_patched_vfio(self)
+            build_igb_uio(self)
         else:
             self.logger.info('TESTER: SKIPPED packages installation')
 
@@ -531,9 +451,6 @@ class DPDKtester(Tester):
         self.build_system = check_build_system(ver_str)
 
         self.send_expect("export RTE_TARGET=" + target, "#")
-        self.send_expect("export RTE_SDK=`pwd`", "#")
-        # May be required by the meson build system for the pktgen
-        self.send_expect("export PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig", "#")
 
         if not test_configs["skip_target_env_setup"]:
             # Remove any previous installed DPDK
@@ -543,14 +460,14 @@ class DPDKtester(Tester):
                 self.send_expect("make config T={} O={}".format(target, target),
                                  "# ", build_time)
                 out = self.send_expect(
-                    "{}make -j {} T={} O={} CONFIG_RTE_EAL_IGB_UIO=y".format(
+                    "{}make -j {} T={} O={}".format(
                         debug_make, self.number_of_cores, target, target),
                     "# ", build_time)
                 check_build(out)
             elif self.build_system is MESON_BUILD:
                 # configure
-                out = self.send_expect("meson %s -Denable_kmods=true" % (target),
-                                 "# ", build_time)
+                out = self.send_expect("meson {} -Dprefix={}".format(target, self.install_dir),
+                                       "# ", build_time)
                 check_build(out)
                 out = self.send_expect("ninja -C %s" %(target), "# ", build_time)
                 check_build(out)
@@ -559,20 +476,19 @@ class DPDKtester(Tester):
             else:
                 assert False, "Invalid build system detected"
 
-            # Update paths to libraries
-            self.send_expect("ldconfig", "#")
-
             self.send_expect("cd {}".format(self.pktgen_dir), "#")
+            include_var = "C_INCLUDE_PATH={}/include".format(self.install_dir)
             if self.build_system is MAKE_BUILD:
-                out = self.send_expect("{}make".format(debug_make), "# ", build_time)
+                out = self.send_expect("{} {} make".format(debug_make, include_var), "# ", build_time)
             else:
                 out = self.send_expect("meson build -Denable_lua=true",
                                        "#", build_time)
                 check_build(out)
-                out = self.send_expect("ninja -C build", "#", build_time)
+                out = self.send_expect("{} ninja -C build".format(include_var), "#", build_time)
             check_build(out)
 
             install_apps(self)
+            self.setup_modules()
             self.send_expect("cd {}".format(self.base_dir), "#")
         else:
             self.logger.info('SKIPPED target environment setup')
@@ -581,8 +497,8 @@ def check_build(msglog):
     msglog_low = msglog.lower()
 
     for l in msglog_low.splitlines():
-        if "cc" not in l:
-            assert ("error" not in  l), "Compilation error..."
+        if "cc" not in l and "werror" not in l:
+            assert ("error" not in l), "Compilation error..."
             assert ("no rule to make" not in l), "No rule to make error..."
 
 def check_build_system(version_str):
@@ -612,6 +528,7 @@ def install_apps(host):
 
 
 def install_packages(host):
+    host.to_base_dir()
     kernel = host.send_expect("uname -r", "# ")
     os_type = host.send_expect("uname -a", "# ")
     os_type = os_type.lower()
@@ -631,13 +548,9 @@ def install_packages(host):
                          " python3 python3-pip python36 python36-pip"
                          .format(kernel, kernel), "# ", 300)
         install_libpcap(host)
-        host.send_expect("echo 'pathmunge /usr/local/bin' > /etc/profile.d/ree.sh", "#")
-        host.send_expect("source /etc/profile", "#")
-        host.send_expect("echo '/usr/local/lib64' > /etc/ld.so.conf.d/dpdk.conf", "#")
-        host.send_expect("echo '/usr/local/lib' >> /etc/ld.so.conf.d/dpdk.conf", "#")
     install_lua(host)
 
-    # Aliast pip-3.6 as pip3 for AmazonLinux instances
+    # Alias pip-3.6 as pip3 for the AmazonLinux instances
     host.send_expect("pip3", "# ")
     if host.send_expect("echo $?", "# ") != "0":
         host.send_expect("alias pip3=pip-3.6", "# ")
@@ -733,20 +646,33 @@ def install_lua(host):
     host.send_expect("tar -zxf lua-5.3.5.tar.gz", host.prompt)
     host.send_expect("cd lua-5.3.5", host.prompt)
     host.send_expect("make linux test", host.prompt)
-    host.send_expect("make install", host.prompt)
-    host.send_expect("ln -s /usr/local/lib/liblua.a /usr/local/lib64/liblua5.3.a", host.prompt)
-    host.send_expect("ln -s /usr/lib/x86_64-linux-gnu/liblua5.3.a /usr/lib/x86_64-linux-gnu/liblua.a", host.prompt)
+    host.send_expect("make install INSTALL_TOP={}".format(host.install_dir), host.prompt)
+    host.send_expect("ln -s {path}/lib/liblua.a {path}/lib64/liblua5.3.a".format(path=host.install_dir), host.prompt)
+    host.send_expect("ln -s {path}/x86_64-linux-gnu/liblua5.3.a {path}/x86_64-linux-gnu/liblua.a".format(
+                     path=host.install_dir), host.prompt)
 
     os_type = host.send_expect("uname -a", "# ")
     os_type = os_type.lower()
-    if "ubuntu" in os_type or "debian" in os_type:
-        pc_path = "/usr/lib/x86_64-linux-gnu/pkgconfig"
-    else:
-        pc_path = "/usr/lib64/pkgconfig"
-    host.send_expect("make pc > {}/lua5.3.pc".format(pc_path), host.prompt)
-    host.send_expect("echo 'Name: lua5.3' >> {}/lua5.3.pc".format(pc_path), host.prompt)
-    host.send_expect("echo 'Version: ${{version}}' >> {}/lua5.3.pc".format(pc_path), host.prompt)
-    host.send_expect("echo 'Description: lua' >> {}/lua5.3.pc".format(pc_path), host.prompt)
-    host.send_expect("echo 'Libs: -L${{libdir}} -llua' >> {}/lua5.3.pc".format(pc_path), host.prompt)
+
+    host.send_expect('mkdir -p $PKG_CONFIG_PATH', "#")
+    pc_file = host.send_expect("echo $PKG_CONFIG_PATH", host.prompt) + "/lua5.3.pc"
+    host.send_expect("make pc INSTALL_TOP={} > {}".format(host.install_dir, pc_file), host.prompt)
+    host.send_expect("echo 'Name: lua5.3' >> {}".format(pc_file), host.prompt)
+    host.send_expect("echo 'Version: ${{version}}' >> {}".format(pc_file), host.prompt)
+    host.send_expect("echo 'Description: lua' >> {}".format(pc_file), host.prompt)
+    host.send_expect("echo 'Libs: -L${{libdir}} -llua' >> {}".format(pc_file), host.prompt)
     out = host.send_expect("pkg-config --libs-only-l lua5.3", host.prompt)
-    print(out)
+    assert ("-llua" in out), "Failed to install lua5.3"
+
+def install_patched_vfio(host):
+    # Enable source packages to be enabled (required on Ubuntu)
+    host.send_expect("sed -i '/^# deb-src.*main/s/^#//' /etc/apt/sources.list", host.prompt)
+    host.send_expect("cd {}/enav2-vfio-patch".format(host.base_dir), host.prompt)
+    out = host.send_expect("./get-vfio-with-wc.sh", host.prompt, 600, verify=True)
+    assert (not isinstance(out, int)), "Failed to install patched vfio-pci module"
+    host.send_expect("rm -rf tmp", host.prompt, 10)
+
+def build_igb_uio(host):
+    host.send_expect("cd {}/dpdk-kmods/linux/igb_uio".format(host.base_dir), host.prompt)
+    out = host.send_expect("make", host.prompt, 30, verify=True)
+    assert (not isinstance(out, int)), "Failed to build igb_uio.ko module"

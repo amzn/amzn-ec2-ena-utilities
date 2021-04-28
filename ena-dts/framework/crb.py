@@ -31,6 +31,9 @@
 
 """
  Changes made to the original file:
+    * Add fields containing setup directories
+    * Add InstanceType enum
+    * Add ISIZE_BW_MAP* global maps
     * Add support for the scapy
     * Use SSH key for connecting to the instances
     * Configure paths and packages that must be sent onto target host
@@ -68,8 +71,13 @@
       - check_setup
       - check_repo
       - path_exist
-      - check_instance_type
       - get_cpu_number
+      - set_env
+      - __check_instance_type
+      - __parse_instance_details
+      * Move setup_modules and restore_modules methods from crbr.py file
+        - Add auto-finding of the igb_uio module
+      * Add remote package for custom vfio-pci module installation
 """
 
 import time
@@ -78,6 +86,7 @@ import net_device
 import os
 import settings
 import json
+from settings import load_global_setting, HOST_DRIVER_SETTING, HOST_DRIVER_MODE_SETTING
 from settings import latency_app, latency_send, latency_echo, reset_app
 from config import PortConf
 from settings import TIMEOUT, IXIA, FOLDERS
@@ -88,7 +97,6 @@ from time import sleep
 """
 CRB (customer reference board) basic functions and handlers
 """
-
 
 class Crb(object):
 
@@ -132,9 +140,12 @@ class Crb(object):
         self.base_dir = "~/dpdk"
         self.pktgen_dir = self.base_dir+"/pktgen"
         self.dst_dir = "/tmp/"
+        self.install_dir = self.base_dir+"/install"
 
         self.packages = ["dpdk.tar.gz",
                          "pktgen.tar.gz",
+                         "enav2-vfio-patch.tar.gz",
+                         "dpdk-kmods.tar.gz",
                          latency_app + ".tar.gz",
                          reset_app + ".tar.gz"]
         self.apps = [latency_app + "/" + latency_send,
@@ -154,6 +165,8 @@ class Crb(object):
         self.test_configs = None
         self.used_port = -1
         self.prompt = "# "
+
+        self.__parse_instance_details()
 
     def send_expect(self, cmds, expected, timeout=TIMEOUT,
                     alt_session=False, verify=False):
@@ -1209,8 +1222,8 @@ up ip rule add from {ip} lookup 1000
 
         for path in self.packages[1:]:
             path = path.split(".")[0]
-            path = FOLDERS["Depends"] + "/" + path
-            if os.path.isfile(path) is True:
+            local_path = FOLDERS["Depends"] + "/" + path
+            if os.path.exists(local_path) is True:
                 remote_path = "{}/{}".format(self.base_dir, path)
                 if self.path_exist(remote_path) is False:
                     return False
@@ -1237,11 +1250,85 @@ up ip rule add from {ip} lookup 1000
         return True
 
     def path_exist(self, path):
-        self.send_expect("ls {}".format(path), "#")
+        self.send_expect("test -e {}".format(path), "#")
         out = self.send_expect("echo $?", "#")
-        return out == "0"
+        return int(out) == 0
 
-    def check_instance_type(self):
+    def get_cpu_number(self):
+        ncpu = self.send_expect("nproc", self.prompt)
+        return int(ncpu)
+
+    def setup_modules(self):
+        """
+        Install DPDK required kernel module.
+        """
+        drivername = load_global_setting(HOST_DRIVER_SETTING)
+        drivermode = load_global_setting(HOST_DRIVER_MODE_SETTING)
+        if drivername == "vfio-pci":
+            self.send_expect("rmmod vfio_pci", "#", 70)
+            self.send_expect("rmmod vfio_iommu_type1", "#", 70)
+            self.send_expect("rmmod vfio", "#", 70)
+            self.send_expect("modprobe vfio", "#", 70)
+            self.send_expect("modprobe vfio-pci", "#", 70)
+            out = self.send_expect("lsmod", "#")
+            assert ("vfio_pci" in out), "Failed to setup vfio-pci"
+
+            if drivermode == "noiommu":
+                out = self.send_expect("echo 1 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode", "#", 70, verify=True)
+                assert (not isinstance(out, int)), "Failed to setup noiommu mode for vfio"
+
+        elif drivername == "uio_pci_generic":
+            self.send_expect("modprobe uio", "#", 70)
+            self.send_expect("modprobe uio_pci_generic", "#", 70)
+            out = self.send_expect("lsmod | grep uio_pci_generic", "#")
+            assert ("uio_pci_generic" in out), "Failed to setup uio_pci_generic"
+        else:
+            self.send_expect("modprobe uio", "#", 70)
+            out = self.send_expect("lsmod | grep igb_uio", "#")
+            if "igb_uio" in out:
+                self.send_expect("rmmod -f igb_uio", "#", 70)
+            wc = "wc_activate=1" if drivermode == "wc" else ""
+            # Locate igb_uio.ko module in the dpdk-kmods directory
+            igb_uio_path = self.send_expect("find dpdk-kmods -name igb_uio.ko", "#")
+            assert igb_uio_path, "Cannot find igb_uio.ko module"
+            # In case we found multiple igb_uio.ko modules, use only the first one.
+            igb_uio_path = igb_uio_path.splitlines()[0]
+
+            self.send_expect("insmod {} {}".format(
+                igb_uio_path, wc), "#", 60)
+
+            out = self.send_expect("lsmod | grep igb_uio", "#")
+            assert ("igb_uio" in out), "Failed to insmod igb_uio"
+
+    def restore_modules(self, skip=False):
+        """
+        Restore DPDK kernel module.
+        """
+        if skip:
+            self.logger.info('SKIPPED restoring modules')
+            return
+
+        drivername = load_global_setting(HOST_DRIVER_SETTING)
+        if drivername == "vfio-pci":
+            drivermode = load_global_setting(HOST_DRIVER_MODE_SETTING)
+            if drivermode == "noiommu":
+                self.send_expect("echo 0 > /sys/module/vfio/parameters/enable_unsafe_noiommu_mode", "#", 70)
+
+    def set_env(self):
+        os_type = self.send_expect("uname -a", "# ")
+        os_type = os_type.lower()
+        if "ubuntu" in os_type or "debian" in os_type:
+            lib_path="lib/x86_64-linux-gnu"
+        else:
+            lib_path="lib64"
+
+        self.send_expect('export RTE_SDK={}'.format(self.base_dir), "#")
+        self.send_expect('export LD_LIBRARY_PATH={}/{}'.format(self.install_dir, lib_path), "#")
+        self.send_expect('export PKG_CONFIG_PATH={}/{}/pkgconfig'.format(self.install_dir, lib_path), "#")
+        self.send_expect('export PATH=$PATH:/usr/local/bin', "#")
+
+
+    def __check_instance_type(self):
         link = "curl http://169.254.169.254/latest/dynamic/instance-identity/document -w '\\n'"
         out = self.send_expect(link, self.prompt)
         data = json.loads(out)
@@ -1249,6 +1336,16 @@ up ip rule add from {ip} lookup 1000
             return data["instanceType"]
         return ""
 
-    def get_cpu_number(self):
-        ncpu = self.send_expect("nproc", self.prompt)
-        return int(ncpu)
+    def __parse_instance_details(self):
+        instance_str = self.__check_instance_type()
+        is_ntype = re.match("[a-zA-Z]\d[a-zA-Z]*n\.\w*", instance_str) is not None
+
+        if is_ntype:
+            self.max_io_queue = 32
+            self.instance_max_gbps = 100
+        else:
+            self.max_io_queue = 8
+            self.instance_max_gbps = 25
+
+        self.logger.debug("Instance type: {}, max BW: {} Gbps, max IO queues: {}".format(
+            instance_str, self.instance_max_gbps, self.max_io_queue))

@@ -45,6 +45,7 @@
       - apply_patches
       - prepare_repos
       - execute
+    * Call restore_modules for tester for dts_run_target
 """
 
 import re           # regular expressions module
@@ -390,7 +391,7 @@ def dts_run_target(duts, testers, targets, test_suites, test_configs):
     Run each target in execution targets.
     """
     for target in targets:
-        log_handler.info("\nTARGET " + target)
+        log_handler.info("TARGET " + target)
         result.target = target
 
         try:
@@ -418,6 +419,7 @@ def dts_run_target(duts, testers, targets, test_suites, test_configs):
 
     for tester in testers:
         tester.restore_interfaces(test_configs["skip_target_env_setup"])
+        tester.restore_modules(test_configs["skip_target_env_setup"])
 
     for dutobj in duts:
         dutobj.stop_ports()
@@ -765,6 +767,27 @@ def prepare_repos(config, dpdk, pktgen):
             if _patched:
                 apply_patches(_apply_input, isRevert=True)
 
+    # Download the amzn-drivers for the patched vfio-pci module
+    if os.path.exists('{}/amzn-drivers'.format(dep)):
+        shutil.rmtree('{}/amzn-drivers'.format(dep))
+
+    amzn_repo = "https://github.com/amzn/amzn-drivers"
+    clone = "git clone {} {}/amzn-drivers".format(amzn_repo, dep)
+    execute(clone)
+    vfio_path = "amzn-drivers/userspace/dpdk"
+    archive = "cd {}; tar -C {} -czf enav2-vfio-patch.tar.gz enav2-vfio-patch > /dev/null".format(
+        dep, vfio_path)
+    execute(archive)
+
+    # Download dpdk-kmods for standalone igb_uio module
+    if os.path.exists('{}/dpdk-kmods'.format(dep)):
+        shutil.rmtree('{}/dpdk-kmods'.format(dep))
+
+    dpdk_kmods_repo = "git://dpdk.org/dpdk-kmods"
+    clone = "git clone {} {}/dpdk-kmods".format(dpdk_kmods_repo, dep)
+    execute(clone)
+    archive = "cd {}; tar -czf dpdk-kmods.tar.gz dpdk-kmods > /dev/null".format(dep)
+    execute(archive)
 
 def execute(cmd):
     print(cmd)
