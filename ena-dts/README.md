@@ -19,7 +19,7 @@ Below applications must be installed on host:
  * git
  * python 2.7
  * numpy
- * pexpect
+ * pexpect v4.6.0 (v4.8.0 has the issues with buffers sync)
  * xlrd
  * xlwt
  * patch
@@ -202,39 +202,7 @@ where:
   * `--BW-queue` suggested number of used queues, min(cpu_cores-2, BW-queue) queues will be started.
   * `--BW-direction` mono - use simplex, bi - use duplex.
 
-Sample test output (c5n.18xlarge <-> c5n.18xlarge, same AZ, non-same placement group):
-
-`./dts -t test_perf_bw --BW-flows 1,8,32 --BW-sizes 1500,9000 --BW-types TCP,UDP --BW-queue 32 --BW-direction bi`:
-
-```
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| direction      | size | flows | Tx queues DUT / Tester | type | Rx on DUT, Mb/s | Rx on Tester, Mb/s | Rx on DUT, pps | Rx on Tester, pps |
-+================+======+=======+========================+======+=================+====================+================+===================+
-| Tester <=> DUT | 1500 | 1     | 1 / 1                  | tcp  | 3406            | 3384               | 280111         | 278333            |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 1500 | 1     | 1 / 1                  | udp  | 3403            | 3503               | 279922         | 288126            |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 1500 | 8     | 8 / 8                  | tcp  | 7730            | 7792               | 635702         | 640843            |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 1500 | 8     | 8 / 8                  | udp  | 27230           | 28642              | 2239356        | 2355461           |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 1500 | 32    | 32 / 32                | tcp  | 8173            | 8138               | 672197         | 669262            |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 1500 | 32    | 32 / 32                | udp  | 44882           | 46415              | 3691003        | 3817026           |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 9000 | 1     | 1 / 1                  | tcp  | 3400            | 3477               | 47125          | 48197             |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 9000 | 1     | 1 / 1                  | udp  | 3412            | 3486               | 47285          | 48314             |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 9000 | 8     | 8 / 8                  | tcp  | 27249           | 28383              | 377628         | 393345            |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 9000 | 8     | 8 / 8                  | udp  | 27436           | 28291              | 380217         | 392067            |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 9000 | 32    | 32 / 32                | tcp  | 48522           | 48519              | 672428         | 672386            |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-| Tester <=> DUT | 9000 | 32    | 32 / 32                | udp  | 81417           | 92100              | 1128294        | 1276339           |
-+----------------+------+-------+------------------------+------+-----------------+--------------------+----------------+-------------------+
-```
+Sample test outputs can be found in the RESULTS.md file.
 
 test_perf_latency
 -----------------
@@ -244,19 +212,7 @@ Second DPDK application sends ping requests from Tester and measures time betwee
 100000 packets are being send. From measurements p50 and p90 and p99 are being calculated.
 Test is being run for 3 packet sizes: 64, 1500 and 9000. If any ping packet is lost, test is marked as failed.
 
-Sample test output(c5n.18xlarge <-> c5n.18xlarge, same AZ, non-same placement group):
-
-```
-+------+---------+---------+---------+-------------+
-| size | p50, us | p90, us | p99, us | pkt loss, % |
-+======+=========+=========+=========+=============+
-| 64   | 33      | 34      | 37      | 0           |
-+------+---------+---------+---------+-------------+
-| 1500 | 38      | 39      | 44      | 0           |
-+------+---------+---------+---------+-------------+
-| 9000 | 56      | 58      | 62      | 0           |
-+------+---------+---------+---------+-------------+
-```
+Sample test outputs can be found in the RESULTS.md file.
 
 Test applications are located in `dep/latency`.
 
@@ -282,15 +238,32 @@ Test output has the same format as `test_perf_bw`.
 
 Additional notes
 ================
-Tested on c5.2xlarge and c5.18xlarge, c5n.18xlarge instances with Amazon Linux
-and Ubuntu.
+Tested on c5.2xlarge and c5.18xlarge, c5n.18xlarge instances with Amazon Linux 2
+and Ubuntu 20.04 and Ubuntu 18.04.
 
-As the test suite have to install the the DPDK libraries (and possibly overwrite
-the currently installed libs) starting from the DPDK v20.05 because of the
-meson build system requirements, it may be possible that there will be
-linking errors if other, possible newer, DPDK was alredy installed.
-To fix that, it may be required to manually remove other DPDK libraries
-(especially there may be conflicts with DPDK v20.05 if v20.08 was already
-installed).
+The test suite may alter system configuration, install new packages on the
+remote machine and change network interfaces configuration. Although the amount
+of needed change is limited, it can still interfere with the existing
+configuration and is unavoidable for correct test execution.
+
+The test suite will override existing vfio-pci module with version supporting
+write-combining and no-iommu mode. To do that, the appropriate kernel sources
+need to be installed.
+
+Due to high amount of space required by the DPDK, pktgen, and Linux kernel
+sources, there should be enough space left on the partition, mounted to the
+`/root` folder.
+
+Note: Outdated AMIs for Ubuntu 20.04 and Ubuntu 18.04 can download sources of
+the newer kernel than the one actually running on the machine. If the DTS will
+report failure of the VFIO installation, please install the latest kernel
+as showed below, reboot the Ubuntu machines and execute the tool once again with
+the same parameters.
+
+```
+sudo apt update
+sudo apt install -y linux-aws
+sudo reboot
+```
 
 DTS documentation: http://dpdk.org/doc/dts/gsg/

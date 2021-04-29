@@ -555,7 +555,7 @@ def install_packages(host):
     if host.send_expect("echo $?", "# ") != "0":
         host.send_expect("alias pip3=pip-3.6", "# ")
     host.send_expect("pip3 install scapy -q", "# ", 200)
-    host.send_expect("pip3 install ninja meson -q", "# ", 200)
+    host.send_expect("pip3 install ninja meson pyelftools -q", "# ", 200)
 
 
 def copy_files(host):
