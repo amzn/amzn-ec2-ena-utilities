@@ -12,6 +12,7 @@
 # 3. BQL to be disabled (required)
 # 4. TX queue size >= 1024 (recommended)
 # 5. RX queue size >= 8192 (recommended)
+# 6. Large LLQ explicitly disabled via module param (recommended when large LLQ is supported)
 
 ### Recommended Configuration
 MTU_RECOMMENDED_MAX=8900
@@ -72,16 +73,38 @@ check_eth_rx_queue_size() {
   fi
 }
 
-check_eth_tx_queue_size() {
+check_eth_tx_queue_size_large_llq() {
   local interface=${1}
   local tx_queue_size=$(${ethtool} -g ${interface} | grep "TX:" | tail -n1 | awk '{print $2}')
-  if [ ${tx_queue_size} -lt ${TX_QUEUE_SIZE_RECOMMENDED} ]; then
-    ((recommended_fail += 1))
-    echo_warn "$interface TX queue size should be >= ${TX_QUEUE_SIZE_RECOMMENDED} for ENA Express, currently set to ${tx_queue_size}"
-    echo_fix "sudo ${ethtool} -G ${interface} tx ${TX_QUEUE_SIZE_RECOMMENDED}"
-  else
+  local large_llq_param_path="/sys/module/ena/parameters/force_large_llq_header"
+
+  if [ "${tx_queue_size}" -ge "${TX_QUEUE_SIZE_RECOMMENDED}" ]; then
     echo_success "${interface} TX queue size is ${tx_queue_size} (good)"
+    return
   fi
+
+  if test -f "${large_llq_param_path}"; then
+    case "$(<"${large_llq_param_path}")" in
+      0)
+        echo_success "Large LLQ is explicitly disabled via module param (good)"
+        ;;
+      *)
+        echo_warn "Large LLQ is not explicitly disabled via module parameter"
+        ((recommended_fail += 1))
+        echo "Consider disabling large LLQ for optimal ENA Express performance"
+        echo_fix "sudo sh -c 'rmmod ena && modprobe ena force_large_llq_header=0'"
+        echo
+        echo "More details about large LLQ are available here:"
+        echo " https://github.com/amzn/amzn-drivers/blob/master/kernel/linux/ena/ENA_Linux_Best_Practices.rst"
+        echo
+        return
+        ;;
+    esac
+  fi
+
+  ((recommended_fail += 1))
+  echo_warn "$interface TX queue size is not at maximum of ${TX_QUEUE_SIZE_RECOMMENDED}, currently set to ${tx_queue_size}"
+  echo_fix "sudo ${ethtool} -G ${interface} tx ${TX_QUEUE_SIZE_RECOMMENDED}"
 }
 
 check_bql_enable() {
@@ -183,8 +206,8 @@ check_ena_express_settings() {
   echo "============= Checking BQL settings ===================="
   check_bql_enable ${interface}
   echo
-  echo "============= Checking TX Queue size ==================="
-  check_eth_tx_queue_size ${interface}
+  echo "============= Checking TX Queue size and Large LLQ ====="
+  check_eth_tx_queue_size_large_llq ${interface}
   echo
   echo "============= Checking RX Queue size ==================="
   check_eth_rx_queue_size ${interface}
