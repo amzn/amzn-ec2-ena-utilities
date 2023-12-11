@@ -204,5 +204,15 @@ if [ $# -ne 1 ]; then
   exit 255
 fi
 
+if [ ! -d "/sys/class/net/${1}" ]; then
+  echo_error "Interface ${1} does not exist"
+  exit 1
+fi
+
+if [ ! -d "/sys/class/net/${1}/device/driver/module" ] || [ "$(basename "$(realpath "/sys/class/net/${1}/device/driver/module")")" != "ena" ]; then
+  echo_error "Interface ${1} does not bind the ENA driver"
+  exit 1
+fi
+
 check_ena_express_settings ${1}
 exit ${required_fail}
