@@ -12,8 +12,9 @@
 # 3. BQL to be disabled (required)
 # 4. TX queue size >= 1024 (recommended)
 # 5. RX queue size >= 8192 (recommended)
+# 6. Large LLQ explicitly disabled via module param (recommended when large LLQ is supported)
 
-# Recommended configuration
+### Recommended Configuration
 MTU_RECOMMENDED_MAX=8900
 MTU_RECOMMENDED_MIN=8800
 TCP_LIMIT_BYTES_RECOMMENDED=1048576
@@ -27,31 +28,23 @@ sysctl="/usr/sbin/sysctl"
 required_fail=0
 recommended_fail=0
 
-echo_success() {
-  local str=$1
-  echo -e "\033[1;32m${str}\033[0m"
-}
+### Utilities
+echo_success() { echo -e "\033[1;32m${1}\033[0m"; }
+echo_error() { echo -e "\033[1;31mERROR: ${1}\033[0m"; }
+echo_warn() { echo -e "\033[1;33mWARN: ${1}\033[0m"; }
+echo_fix() { echo -e "$(tput bold)To fix, run:$(tput sgr0)\n  ${1}"; }
 
-echo_error() {
-  local str=$1
-  echo -e "\033[1;31mERROR: ${str}\033[0m"
-}
-
-echo_warn() {
-  local str=$1
-  echo -e "\033[1;33mWARN: ${str}\033[0m"
-}
-
+### Tests
 check_eth_mtu() {
   local interface=${1}
   local mtu=$(ip link show ${interface} | awk '{print $5}')
   if [ ${mtu} -gt ${MTU_RECOMMENDED_MAX} ]; then
     ((required_fail += 1))
     echo_error "MTU should be <= ${MTU_RECOMMENDED_MAX} for ENA Express, currently set to ${mtu}"
-    echo "To fix run: sudo ip link set ${interface} mtu ${MTU_RECOMMENDED_MAX}"
+    echo_fix "sudo ip link set ${interface} mtu ${MTU_RECOMMENDED_MAX}"
   elif [ ${mtu} -lt ${MTU_RECOMMENDED_MIN} ]; then
     echo_warn "MTU lower than recommended and not optimal for bandwidth performance, currently set to ${mtu}"
-    echo "To fix run: sudo ip link set ${interface} mtu ${MTU_RECOMMENDED_MAX}"
+    echo_fix "sudo ip link set ${interface} mtu ${MTU_RECOMMENDED_MAX}"
   else
     echo_success "${interface} MTU value is $mtu (good)"
   fi
@@ -62,7 +55,7 @@ check_tcp_limit_output_bytes() {
   if [ ${limit_bytes} -lt ${TCP_LIMIT_BYTES_RECOMMENDED} ]; then
     ((required_fail += 1))
     echo_error "tcp_limit_output_bytes should be >= ${TCP_LIMIT_BYTES_RECOMMENDED} for ENA Express, currently set to ${limit_bytes}"
-    echo "To fix run: sudo sh -c 'echo ${TCP_LIMIT_BYTES_RECOMMENDED} > /proc/sys/net/ipv4/tcp_limit_output_bytes'"
+    echo_fix "sudo sh -c 'echo ${TCP_LIMIT_BYTES_RECOMMENDED} > /proc/sys/net/ipv4/tcp_limit_output_bytes'"
   else
     echo_success "IPv4 tcp_limit_output_bytes value is ${limit_bytes} (good)"
   fi
@@ -74,22 +67,44 @@ check_eth_rx_queue_size() {
   if [ ${rx_queue_size} -lt ${RX_QUEUE_SIZE_RECOMMENDED} ]; then
     ((recommended_fail += 1))
     echo_warn "$interface RX queue size should be >= ${RX_QUEUE_SIZE_RECOMMENDED} for ENA Express, currently set to ${rx_queue_size}"
-    echo "To fix run: sudo ${ethtool} -G ${interface} rx ${RX_QUEUE_SIZE_RECOMMENDED}"
+    echo_fix "sudo ${ethtool} -G ${interface} rx ${RX_QUEUE_SIZE_RECOMMENDED}"
   else
     echo_success "${interface} RX queue size is ${rx_queue_size} (good)"
   fi
 }
 
-check_eth_tx_queue_size() {
+check_eth_tx_queue_size_large_llq() {
   local interface=${1}
   local tx_queue_size=$(${ethtool} -g ${interface} | grep "TX:" | tail -n1 | awk '{print $2}')
-  if [ ${tx_queue_size} -lt ${TX_QUEUE_SIZE_RECOMMENDED} ]; then
-    ((recommended_fail += 1))
-    echo_warn "$interface TX queue size should be >= ${TX_QUEUE_SIZE_RECOMMENDED} for ENA Express, currently set to ${tx_queue_size}"
-    echo "To fix run: sudo ${ethtool} -G ${interface} tx ${TX_QUEUE_SIZE_RECOMMENDED}"
-  else
+  local large_llq_param_path="/sys/module/ena/parameters/force_large_llq_header"
+
+  if [ "${tx_queue_size}" -ge "${TX_QUEUE_SIZE_RECOMMENDED}" ]; then
     echo_success "${interface} TX queue size is ${tx_queue_size} (good)"
+    return
   fi
+
+  if test -f "${large_llq_param_path}"; then
+    case "$(<"${large_llq_param_path}")" in
+      0)
+        echo_success "Large LLQ is explicitly disabled via module param (good)"
+        ;;
+      *)
+        echo_warn "Large LLQ is not explicitly disabled via module parameter"
+        ((recommended_fail += 1))
+        echo "Consider disabling large LLQ for optimal ENA Express performance"
+        echo_fix "sudo sh -c 'rmmod ena && modprobe ena force_large_llq_header=0'"
+        echo
+        echo "More details about large LLQ are available here:"
+        echo " https://github.com/amzn/amzn-drivers/blob/master/kernel/linux/ena/ENA_Linux_Best_Practices.rst"
+        echo
+        return
+        ;;
+    esac
+  fi
+
+  ((recommended_fail += 1))
+  echo_warn "$interface TX queue size is not at maximum of ${TX_QUEUE_SIZE_RECOMMENDED}, currently set to ${tx_queue_size}"
+  echo_fix "sudo ${ethtool} -G ${interface} tx ${TX_QUEUE_SIZE_RECOMMENDED}"
 }
 
 check_bql_enable() {
@@ -109,7 +124,7 @@ check_bql_enable() {
 
   if [ ${enable_bql} == 1 ]; then
     echo_error "BQL is enabled on $interface which is not optimal for ENA Express"
-    echo "To fix run: sudo sh -c 'for txq in /sys/class/net/${interface}/queues/tx-*; do echo max > \${txq}/byte_queue_limits/limit_min; done'"
+    echo_fix "sudo sh -c 'for txq in /sys/class/net/${interface}/queues/tx-*; do echo max > \${txq}/byte_queue_limits/limit_min; done'"
     ((required_fail += 1))
   else
     echo_success "BQL is disabled on ${interface} (good)"
@@ -184,24 +199,42 @@ check_ena_express_settings() {
   fi
   echo "============= Checking MTU ============================="
   check_eth_mtu ${interface}
+  echo
   echo "============= Checking TCP settings ===================="
   check_tcp_limit_output_bytes
+  echo
   echo "============= Checking BQL settings ===================="
   check_bql_enable ${interface}
-  echo "============= Checking TX Queue size ==================="
-  check_eth_tx_queue_size ${interface}
+  echo
+  echo "============= Checking TX Queue size and Large LLQ ====="
+  check_eth_tx_queue_size_large_llq ${interface}
+  echo
   echo "============= Checking RX Queue size ==================="
   check_eth_rx_queue_size ${interface}
+  echo
   echo "============= Misc network configuration ==============="
   check_network_misc ${interface}
+  echo
   echo "============= Results =================================="
   print_results
 }
+
+### Entrypoint
 
 if [ $# -ne 1 ]; then
   echo_error "Interface argument is required"
   echo "Usage: ${0} <interface>"
   exit 255
+fi
+
+if [ ! -d "/sys/class/net/${1}" ]; then
+  echo_error "Interface ${1} does not exist"
+  exit 1
+fi
+
+if [ ! -d "/sys/class/net/${1}/device/driver/module" ] || [ "$(basename "$(realpath "/sys/class/net/${1}/device/driver/module")")" != "ena" ]; then
+  echo_error "Interface ${1} does not bind the ENA driver"
+  exit 1
 fi
 
 check_ena_express_settings ${1}
