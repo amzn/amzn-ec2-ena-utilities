@@ -66,7 +66,7 @@ check_tcp_autocorking() {
   local autocorking=$(cat /proc/sys/net/ipv4/tcp_autocorking)
   if [ ${autocorking} -ne 0 ]; then
     ((required_fail += 1))
-    echo_warn "tcp_autocorking should be 0 for ENA Express, currently set to ${autocorking}"
+    echo_warn "tcp_autocorking is currently set to ${autocorking}, it is recommended to set it to 0 for ENA Express"
     echo_fix "sudo sh -c 'echo 0 > /proc/sys/net/ipv4/tcp_autocorking'"
   else
     echo_success "net.ipv4.tcp_autocorking is disabled (good)"
