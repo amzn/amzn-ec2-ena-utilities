@@ -10,9 +10,10 @@
 # 1. MTU <= 8900 (required)
 # 2. tcp_limit_output_bytes >= 1MB (required)
 # 3. BQL to be disabled (required)
-# 4. TX queue size >= 1024 (recommended)
-# 5. RX queue size >= 8192 (recommended)
-# 6. Large LLQ explicitly disabled via module param (recommended when large LLQ is supported)
+# 4. tcp_autocorking = 0 (recommended)
+# 5. TX queue size >= 1024 (recommended)
+# 6. RX queue size >= 8192 (recommended)
+# 7. Large LLQ explicitly disabled via module param (recommended when large LLQ is supported)
 
 ### Recommended Configuration
 MTU_RECOMMENDED_MAX=8900
@@ -58,6 +59,17 @@ check_tcp_limit_output_bytes() {
     echo_fix "sudo sh -c 'echo ${TCP_LIMIT_BYTES_RECOMMENDED} > /proc/sys/net/ipv4/tcp_limit_output_bytes'"
   else
     echo_success "IPv4 tcp_limit_output_bytes value is ${limit_bytes} (good)"
+  fi
+}
+
+check_tcp_autocorking() {
+  local autocorking=$(cat /proc/sys/net/ipv4/tcp_autocorking)
+  if [ ${autocorking} -ne 0 ]; then
+    ((recommended_fail += 1))
+    echo_warn "tcp_autocorking is currently set to ${autocorking}, it is recommended to set it to 0 for ENA Express"
+    echo_fix "sudo sh -c 'echo 0 > /proc/sys/net/ipv4/tcp_autocorking'"
+  else
+    echo_success "net.ipv4.tcp_autocorking is disabled (good)"
   fi
 }
 
@@ -202,6 +214,7 @@ check_ena_express_settings() {
   echo
   echo "============= Checking TCP settings ===================="
   check_tcp_limit_output_bytes
+  check_tcp_autocorking
   echo
   echo "============= Checking BQL settings ===================="
   check_bql_enable ${interface}
