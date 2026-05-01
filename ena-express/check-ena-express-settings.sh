@@ -3,22 +3,33 @@
 # This script checks the instance configuration for optimal
 # ENA Express performance and suggests the recommended configuration.
 #
-# Usage: ./check-ena-express-settings.sh <interface>
-# Example: ./check-ena-express-settings.sh eth0
+# Usage: ./check-ena-express-settings.sh -i|--interface <interface> [--low-rtt]
+# Options:
+#  -i, --interface            Target network interface.
+#  --low-rtt                  Skip checks for high latency environment (high RTT checks are enabled by default).
+#
+# Example: ./check-ena-express-settings.sh --interface eth0 --low-rtt
 #
 # Description of checks and whether they are required/recommended.
 # 1. MTU <= 8900 (required)
-# 2. tcp_limit_output_bytes >= 1MB (required)
+# 2. tcp_limit_output_bytes >= 1MB / 4MB (required. 4MB for high RTT environments)
 # 3. BQL to be disabled (required)
 # 4. tcp_autocorking = 0 (recommended)
-# 5. TX queue size >= 1024 (recommended)
-# 6. RX queue size >= 8192 (recommended)
+# 5. TX queue size >= min(1024, pre-set maximum) (recommended)
+# 6. RX queue size >= min(8192, pre-set maximum) (recommended)
 # 7. Large LLQ explicitly disabled via module param (recommended when large LLQ is supported)
+# 8. net.ipv4.tcp_rmem, net.ipv4.tcp_wmem tuples - set maximum window value to 8MB at least (required for high RTT environments)
+# 9. net.core.[rw]mem_default >= 4MB, net.core.[rw]mem_max >= 8MB (required for high RTT environments)
+# 10. net.ipv4.tcp_congestion_control=cubic, tcp_cubic.parameters.hystart_detect = 0 (required for high RTT environments)
 
 ### Recommended Configuration
 MTU_RECOMMENDED_MAX=8900
 MTU_RECOMMENDED_MIN=8800
 TCP_LIMIT_BYTES_RECOMMENDED=1048576
+TCP_LIMIT_BYTES_RECOMMENDED_HIGH_RTT=4194304
+TCP_MEM_RECOMMENDED_HIGH_RTT_MAX=8388608
+NET_SOCKET_BUFFER_SIZE_RECOMMENDED_DEFAULT_HIGH_RTT=4194304
+NET_SOCKET_BUFFER_SIZE_RECOMMENDED_MAXIMUM_HIGH_RTT=8388608
 TX_QUEUE_SIZE_RECOMMENDED=1024
 RX_QUEUE_SIZE_RECOMMENDED=8192
 
@@ -26,19 +37,41 @@ set -euo pipefail
 
 ethtool="/usr/sbin/ethtool"
 sysctl="/usr/sbin/sysctl"
+ip="/usr/sbin/ip"
 required_fail=0
 recommended_fail=0
 
 ### Utilities
 echo_success() { echo -e "\033[1;32m${1}\033[0m"; }
-echo_error() { echo -e "\033[1;31mERROR: ${1}\033[0m"; }
+echo_error() { echo -e "\033[1;31mERROR: ${1}\033[0m" 1>&2; }
 echo_warn() { echo -e "\033[1;33mWARN: ${1}\033[0m"; }
-echo_fix() { echo -e "$(tput bold)To fix, run:$(tput sgr0)\n  ${1}"; }
+echo_fix() { echo -e "\033[1mTo fix, run:\033[0m\n  ${1}"; }
+min() { echo $(( $1 < $2 ? $1 : $2 )); }
+
+setting_evaluator() {
+  local setting_name=${1}
+  local recommended=${2}
+  local setting_location="/proc/sys/${setting_name//\.//}"
+  local current_value="undefined"
+  local change_required=true
+
+  if [ -f ${setting_location} ]; then
+    current_value=$(cat ${setting_location})
+    change_required=$([[ ${current_value} -lt ${recommended} ]] && echo true || echo false)
+  fi
+  if [ ${change_required} = true ]; then
+    ((required_fail += 1))
+    echo_error "${setting_name} should be >= ${recommended} for ENA Express, currently set to ${current_value}"
+    echo_fix "sudo sh -c 'echo ${recommended} > ${setting_location}'"
+  else
+    echo_success "${setting_name} value is ${current_value} (good)"
+  fi
+}
 
 ### Tests
 check_eth_mtu() {
   local interface=${1}
-  local mtu=$(ip link show ${interface} | awk '{print $5}')
+  local mtu=$(${ip} link show ${interface} | awk '{print $5}')
   if [ ${mtu} -gt ${MTU_RECOMMENDED_MAX} ]; then
     ((required_fail += 1))
     echo_error "MTU should be <= ${MTU_RECOMMENDED_MAX} for ENA Express, currently set to ${mtu}"
@@ -52,13 +85,70 @@ check_eth_mtu() {
 }
 
 check_tcp_limit_output_bytes() {
-  local limit_bytes=$(cat /proc/sys/net/ipv4/tcp_limit_output_bytes)
-  if [ ${limit_bytes} -lt ${TCP_LIMIT_BYTES_RECOMMENDED} ]; then
-    ((required_fail += 1))
-    echo_error "tcp_limit_output_bytes should be >= ${TCP_LIMIT_BYTES_RECOMMENDED} for ENA Express, currently set to ${limit_bytes}"
-    echo_fix "sudo sh -c 'echo ${TCP_LIMIT_BYTES_RECOMMENDED} > /proc/sys/net/ipv4/tcp_limit_output_bytes'"
+  [[ $HIGH_RTT = true ]] && recommended="${TCP_LIMIT_BYTES_RECOMMENDED_HIGH_RTT}" || recommended="${TCP_LIMIT_BYTES_RECOMMENDED}"
+  setting_evaluator "net.ipv4.tcp_limit_output_bytes" ${recommended}
+}
+
+check_tcp_socket_buffer_size() {
+  echo "========= rmem/wmem ===================================="
+  read -r min_size default_size max_size <<< "$(${sysctl} -n net.ipv4.tcp_rmem)"
+  if [ ${max_size} -lt ${TCP_MEM_RECOMMENDED_HIGH_RTT_MAX} ]; then
+    ((recommended_fail += 1))
+    echo_warn "net.ipv4.tcp_rmem max size should be >= ${TCP_MEM_RECOMMENDED_HIGH_RTT_MAX} for ENA Express in high RTT environment, currently set to ${max_size}"
+    echo_fix "sudo ${sysctl} -w net.ipv4.tcp_rmem=\"${min_size} ${default_size} ${TCP_MEM_RECOMMENDED_HIGH_RTT_MAX}\""
   else
-    echo_success "IPv4 tcp_limit_output_bytes value is ${limit_bytes} (good)"
+    echo_success "net.ipv4.tcp_rmem max size is ${max_size} (good)"
+  fi
+
+  read -r min_size default_size max_size <<< "$(${sysctl} -n net.ipv4.tcp_wmem)"
+  if [ ${max_size} -lt ${TCP_MEM_RECOMMENDED_HIGH_RTT_MAX} ]; then
+    ((recommended_fail += 1))
+    echo_warn "net.ipv4.tcp_wmem max size should be >= ${TCP_MEM_RECOMMENDED_HIGH_RTT_MAX} for ENA Express in high RTT environment, currently set to ${max_size}"
+    echo_fix "sudo ${sysctl} -w net.ipv4.tcp_wmem=\"${min_size} ${default_size} ${TCP_MEM_RECOMMENDED_HIGH_RTT_MAX}\""
+  else
+    echo_success "net.ipv4.tcp_wmem max size is ${max_size} (good)"
+  fi
+}
+
+check_tcp_cubic_hybrid_start() {
+  echo "========= tcp cubic hybrid start ============================="
+  local algo=$(cat /proc/sys/net/ipv4/tcp_congestion_control)
+  if [[ "${algo}" != "cubic" ]]; then
+    ((required_fail += 1))
+    echo_error "net.ipv4.tcp_congestion_control should be set to cubic, currently set to ${algo}"
+    echo_fix "${sysctl} -w net.ipv4.tcp_congestion_control=cubic"
+  fi
+  local current_value=$(cat /sys/module/tcp_cubic/parameters/hystart_detect)
+  if ((current_value != 0)); then
+    ((required_fail += 1))
+    echo_error "module.tcp_cubic.parameters.hystart_detect should be equal to 0 for ENA Express, currently set to ${current_value}"
+    echo_fix "sudo sh -c 'echo 0 > /sys/module/tcp_cubic/parameters/hystart_detect'"
+  else
+    echo_success "sys.module.tcp_cubic.parameters.hystart_detect value is ${current_value} (good)"
+  fi
+}
+
+check_tcp_settings() {
+  check_tcp_limit_output_bytes
+  check_tcp_autocorking
+  if [[ ${HIGH_RTT} = true ]]; then
+    check_tcp_socket_buffer_size
+    check_tcp_cubic_hybrid_start
+  fi
+}
+
+check_net_socket_buffer_size() {
+  echo "========= rmem/wmem ===================================="
+  if [[ ${HIGH_RTT} = true ]]; then
+    setting_evaluator "net.core.rmem_default" ${NET_SOCKET_BUFFER_SIZE_RECOMMENDED_DEFAULT_HIGH_RTT}
+    setting_evaluator "net.core.rmem_max" ${NET_SOCKET_BUFFER_SIZE_RECOMMENDED_MAXIMUM_HIGH_RTT}
+    setting_evaluator "net.core.wmem_default" ${NET_SOCKET_BUFFER_SIZE_RECOMMENDED_DEFAULT_HIGH_RTT}
+    setting_evaluator "net.core.wmem_max" ${NET_SOCKET_BUFFER_SIZE_RECOMMENDED_MAXIMUM_HIGH_RTT}
+  else
+    ${sysctl} net.core.rmem_default
+    ${sysctl} net.core.rmem_max
+    ${sysctl} net.core.wmem_default
+    ${sysctl} net.core.wmem_max
   fi
 }
 
@@ -75,28 +165,33 @@ check_tcp_autocorking() {
 
 check_eth_rx_queue_size() {
   local interface=${1}
-  local rx_queue_size=$(${ethtool} -g ${interface} | grep "RX:" | tail -n1 | awk '{print $2}')
-  if [ ${rx_queue_size} -lt ${RX_QUEUE_SIZE_RECOMMENDED} ]; then
+  # rx_q_size_values[0] holds the preconfigured maximum, rx_q_size_values[1] holds the current setting
+  local rx_q_size_values=($(${ethtool} -g ${interface} | grep "RX:" | awk '{print $2}'))
+  local recommended_rx_q_size_value=$(min "${rx_q_size_values[0]}" "${RX_QUEUE_SIZE_RECOMMENDED}")
+
+  if [ "${rx_q_size_values[1]}" -lt "${recommended_rx_q_size_value}" ]; then
     ((recommended_fail += 1))
-    echo_warn "$interface RX queue size should be >= ${RX_QUEUE_SIZE_RECOMMENDED} for ENA Express, currently set to ${rx_queue_size}"
-    echo_fix "sudo ${ethtool} -G ${interface} rx ${RX_QUEUE_SIZE_RECOMMENDED}"
+    echo_warn "$interface RX queue size should be >= ${recommended_rx_q_size_value} for ENA Express, currently set to ${rx_q_size_values[1]}"
+    echo_fix "sudo ${ethtool} -G ${interface} rx ${recommended_rx_q_size_value}"
   else
-    echo_success "${interface} RX queue size is ${rx_queue_size} (good)"
+    echo_success "${interface} RX queue size is ${rx_q_size_values[1]} (good)"
   fi
 }
 
 check_eth_tx_queue_size_large_llq() {
   local interface=${1}
-  local tx_queue_size=$(${ethtool} -g ${interface} | grep "TX:" | tail -n1 | awk '{print $2}')
+  # tx_q_size_values[0] holds the preconfigured maximum, tx_q_size_values[1] holds the current setting
+  local tx_q_size_values=($(${ethtool} -g ${interface} | grep "TX:" | awk '{print $2}'))
+  local recommended_tx_q_size_value=$(min "${tx_q_size_values[0]}" "${TX_QUEUE_SIZE_RECOMMENDED}")
   local large_llq_param_path="/sys/module/ena/parameters/force_large_llq_header"
 
-  if [ "${tx_queue_size}" -ge "${TX_QUEUE_SIZE_RECOMMENDED}" ]; then
-    echo_success "${interface} TX queue size is ${tx_queue_size} (good)"
+  if [  "${tx_q_size_values[1]}" -ge "${recommended_tx_q_size_value}" ]; then
+    echo_success "${interface} TX queue size is ${tx_q_size_values[1]} (good)"
     return
   fi
 
   if test -f "${large_llq_param_path}"; then
-    case "$(<"${large_llq_param_path}")" in
+    case "$(< "${large_llq_param_path}")" in
       0)
         echo_success "Large LLQ is explicitly disabled via module param (good)"
         ;;
@@ -115,8 +210,8 @@ check_eth_tx_queue_size_large_llq() {
   fi
 
   ((recommended_fail += 1))
-  echo_warn "$interface TX queue size is not at maximum of ${TX_QUEUE_SIZE_RECOMMENDED}, currently set to ${tx_queue_size}"
-  echo_fix "sudo ${ethtool} -G ${interface} tx ${TX_QUEUE_SIZE_RECOMMENDED}"
+  echo_warn "$interface TX queue size is not at maximum of ${recommended_tx_q_size_value}, currently set to ${tx_q_size_values[1]}"
+  echo_fix "sudo ${ethtool} -G ${interface} tx ${recommended_tx_q_size_value}"
 }
 
 check_bql_enable() {
@@ -166,13 +261,6 @@ check_network_misc() {
   echo "========= ethtool -l ==================================="
   ${ethtool} -l ${interface}
 
-  # rmem/wmem
-  echo "========= rmem/wmem ===================================="
-  ${sysctl} net.core.rmem_default
-  ${sysctl} net.core.rmem_max
-  ${sysctl} net.core.wmem_default
-  ${sysctl} net.core.wmem_max
-
   # busy_poll
   echo "========= busy_poll ===================================="
   ${sysctl} net.core.busy_poll
@@ -196,7 +284,7 @@ print_results() {
 check_ena_express_settings() {
   local interface=${1}
   if [ -e "/sys/class/net/${interface}/device" ]; then
-    echo "Checking interface ${interface}"
+    echo "Checking interface ${interface} high RTT mode=${HIGH_RTT}"
   else
     echo_error "interface ${interface} does not exist"
     exit 255
@@ -213,8 +301,9 @@ check_ena_express_settings() {
   check_eth_mtu ${interface}
   echo
   echo "============= Checking TCP settings ===================="
-  check_tcp_limit_output_bytes
-  check_tcp_autocorking
+  check_tcp_settings
+  echo "============= Checking Network socket settings ========="
+  check_net_socket_buffer_size
   echo
   echo "============= Checking BQL settings ===================="
   check_bql_enable ${interface}
@@ -232,23 +321,64 @@ check_ena_express_settings() {
   print_results
 }
 
+usage() {
+  echo
+  echo "Check network and ENA driver settings for ENA Express optimal performance"
+  echo
+  echo "Usage: ${0} -i|--interface <interface> [--low-rtt]"
+  echo
+  echo "Options:"
+  echo "-i, --interface            Target network interface."
+  echo "--low-rtt                  Skip checks for high latency environment (high RTT checks are enabled by default)."
+  echo "-h, --help                 Print this help message and exit."
+}
+
 ### Entrypoint
 
-if [ $# -ne 1 ]; then
+HIGH_RTT=true
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -i | --interface)
+      shift
+      if [ "$#" -eq 0 ]; then
+        echo_error "Non-empty interface id is required"
+        usage
+        exit 255
+      fi
+      interface="${1}"
+      ;;
+    --low-rtt)
+      HIGH_RTT=false
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo_error "Unexpected argument: $1"
+      usage
+      exit 255
+      ;;
+  esac
+  shift
+done
+
+if [ -z "${interface+x}" ]; then
   echo_error "Interface argument is required"
-  echo "Usage: ${0} <interface>"
+  usage
   exit 255
 fi
 
-if [ ! -d "/sys/class/net/${1}" ]; then
-  echo_error "Interface ${1} does not exist"
+if [ ! -d "/sys/class/net/${interface}" ]; then
+  echo_error "Interface ${interface} does not exist"
   exit 1
 fi
 
-if [ ! -d "/sys/class/net/${1}/device/driver/module" ] || [ "$(basename "$(realpath "/sys/class/net/${1}/device/driver/module")")" != "ena" ]; then
-  echo_error "Interface ${1} does not bind the ENA driver"
+if [ ! -d "/sys/class/net/${interface}/device/driver/module" ] || [ "$(basename "$(realpath "/sys/class/net/${interface}/device/driver/module")")" != "ena" ]; then
+  echo_error "Interface ${interface} does not bind the ENA driver"
   exit 1
 fi
 
-check_ena_express_settings ${1}
+check_ena_express_settings ${interface}
 exit ${required_fail}
